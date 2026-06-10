@@ -217,12 +217,20 @@ void FanucClient::writeJointTarget(const Eigen::VectorXd& joint_targets)
 {
   AssertIsStreaming(is_streaming_);
   readStateFromQueue();
-  if (robot_status_.motion_possible && do_motn_ctrl_)
+  if (do_motn_ctrl_)
   {
+    // Active control: always stream the (continuous, open-loop) command. Do NOT
+    // fall back to the measured/servo position on a transient motion_possible
+    // flicker — the servo position lags the command, so snapping to it injects a
+    // discontinuity that rings the robot about the set point. Genuine stops are
+    // handled separately via the in_error / fault path (the host streamer stops
+    // commanding on a fault).
     last_joint_angles_cmd_ = joint_targets;
   }
   else
   {
+    // Read-only / motion disabled: track the measured position so the command
+    // equals the current pose (no motion now, and no jump when motion is enabled).
     last_joint_angles_cmd_ = last_joint_angles_;
   }
 
