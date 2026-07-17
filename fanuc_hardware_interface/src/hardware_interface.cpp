@@ -365,7 +365,6 @@ FanucHardwareInterface::on_configure(const rclcpp_lifecycle::State& /*previous_s
       fanuc_client_.reset();
       fanuc_client_ = std::make_unique<fanuc_client::FanucClient>(ip_address_, stream_motion_port_, rmi_port_);
       fanuc_client_->setDoMotnCtrl(initial_motion_control);
-      fanuc_client_->setOutCmdInterpBuffTarget(out_cmd_interp_buff_target_);
       fanuc_client_->setForceSensorType(force_sensor_type_);
       if (initial_motion_control)
       {

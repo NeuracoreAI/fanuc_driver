@@ -6,13 +6,21 @@
 #include "fanuc_client/fanuc_client.hpp"
 
 #include <Eigen/Core>
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <csignal>
 #include <cstdint>
 #include <iostream>
 #include <mutex>
+#include <string>
 #include <utility>
 
 #include "fanuc_client/gpio_buffer.hpp"
+#include "fanuc_client/joint_command_sample.hpp"
+#if defined(FANUC_CLIENT_COMMAND_PLOT)
+#include "fanuc_client/joint_command_plotter.hpp"
+#endif
 #include "readerwriterqueue.h"
 #include "stream_motion/packets.hpp"
 
@@ -72,11 +80,10 @@ constexpr ContactStopMode ToContactStopMode(stream_motion::ContactStopStatus sta
 
 struct FanucClient::PQueueImpl
 {
-  using StampedEigen = std::tuple<std::chrono::duration<double>, Eigen::VectorXd>;
-  // TODO: Consider merging the command and command_io queues.
-  moodycamel::BlockingReaderWriterQueue<StampedEigen> command_queue_;
   moodycamel::BlockingReaderWriterQueue<std::array<uint8_t, 256>> command_io_queue_;
   moodycamel::BlockingReaderWriterQueue<stream_motion::RobotStatusPacket> robot_state_queue_;
+  // ~32 s at 125 Hz; RT thread try_enqueues, plotter thread drains.
+  moodycamel::ReaderWriterQueue<JointCommandSample> command_plot_queue_{ 4096 };
 };
 
 FanucClient::FanucClient(std::string robot_ip, const uint16_t stream_motion_port, const uint16_t rmi_port,
@@ -92,7 +99,6 @@ FanucClient::FanucClient(std::string robot_ip, const uint16_t stream_motion_port
   , rmi_connection_{ rmi_connection_interface == nullptr ?
                          RMISingleton::creatNewRMIInstance(robot_ip_, rmi_port_) :
                          RMISingleton::setRMIInstance(std::move(rmi_connection_interface)) }
-  , out_cmd_interp_buff_target_{ 8 }
   , force_sensor_type_{ 0 }
   , p_queue_impl_(std::make_unique<PQueueImpl>())
 {
@@ -103,12 +109,15 @@ FanucClient::FanucClient(std::string robot_ip, const uint16_t stream_motion_port
   control_period_ = controller_capability.sampling_rate;
   client_version_ = controller_capability.available_version;
   fetchRobotLimits();
+  refreshStreamInterpolatorLimits(stream_v_peak_.load(std::memory_order_relaxed), stream_limit_payload_);
 
   setupSignalHandler();
 }
 
 FanucClient::~FanucClient()
 {
+  setCommandPlotEnabled(false);
+
   if (is_streaming_)
   {
     try
@@ -238,8 +247,11 @@ void FanucClient::writeJointTarget(const Eigen::VectorXd& joint_targets)
   {
     throw std::invalid_argument("Joint targets size does not match the size of last joint angles.");
   }
-  auto cur_time_from_start = std::chrono::high_resolution_clock::now() - start_time_;
-  p_queue_impl_->command_queue_.enqueue({ cur_time_from_start, last_joint_angles_cmd_ });
+  {
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    command_target_ = last_joint_angles_cmd_;
+    command_target_valid_ = true;
+  }
 }
 
 void FanucClient::writeJointTargetRMI(const Eigen::VectorXd& joint_targets)
@@ -306,15 +318,15 @@ bool FanucClient::sendIOCommand() const
 void FanucClient::streamMotionThread(const Eigen::VectorXd& joint_angles)
 {
   stream_motion::RobotStatusPacket status;
-  double command_timestamp = 0.0;
-  double last_command_timestamp = 0.0;
-  Eigen::VectorXd command = joint_angles;
-  Eigen::VectorXd last_command = joint_angles;
   std::array<uint8_t, 256> command_io{};
-  double ts_drift = 0.0;
-  double dev_time = 0.0;
-  double dev_time_prev = 0.0;
   bool motion_possible = false;
+  const double dt_s = static_cast<double>(control_period_) / 1000.0;
+
+  stream_interpolator_.reset(joint_angles);
+  for (Eigen::Index i = 0; i < joint_angles.size(); ++i)
+  {
+    command_pos[i] = joint_angles[i];
+  }
 
   while (is_streaming_)
   {
@@ -325,77 +337,29 @@ void FanucClient::streamMotionThread(const Eigen::VectorXd& joint_angles)
     }
     else
     {
-      if (status.status & 0x1)
-      {
-        motion_possible = true;
-      }
-      else
-      {
-        motion_possible = false;
-      }
+      motion_possible = (status.status & 0x1) != 0;
     }
 
-    // set estimated time to first command's timestamp
-    if ((dev_time == 0.0) && (p_queue_impl_->command_queue_.size_approx() != 0))
-    {
-      const PQueueImpl::StampedEigen* queue_entry = p_queue_impl_->command_queue_.peek();
-      dev_time = std::get<0>(*queue_entry).count();
-      dev_time_prev = dev_time;
-    }
-    else
-    {
-      // calculate drift
-      double time_error = static_cast<double>(p_queue_impl_->command_queue_.size_approx()) -
-                          static_cast<double>(out_cmd_interp_buff_target_);
-      ts_drift = 0.99 * ts_drift + time_error * 0.000001;
-
-      // push the time forward
-      dev_time_prev = dev_time;
-      dev_time += (getControlPeriod() / 1000.0) + ts_drift;
-    }
-
-    int size_before = p_queue_impl_->command_queue_.size_approx();
-
-    // find the right interval to use.
-    while (p_queue_impl_->command_queue_.size_approx() != 0)
-    {
-      const PQueueImpl::StampedEigen* queue_entry = p_queue_impl_->command_queue_.peek();
-      last_command = command;
-      last_command_timestamp = command_timestamp;
-      command_timestamp = std::get<0>(*queue_entry).count();
-      command = std::get<1>(*queue_entry);
-      if (dev_time == 0.0)
-      {
-        dev_time = command_timestamp;
-        dev_time_prev = command_timestamp;
-      }
-      if (command_timestamp >= dev_time_prev)
-      {
-        break;
-      }
-      p_queue_impl_->command_queue_.pop();
-    }
-
-    // Do interpolation.
-    double alpha;
-    if (command_timestamp - last_command_timestamp < 1e-6)
-    {
-      alpha = 0;
-    }
-    else
-    {
-      alpha = (dev_time_prev - last_command_timestamp) / (command_timestamp - last_command_timestamp);
-    }
-    alpha = std::min(alpha, 1.0);
-    alpha = std::max(alpha, 0.0);
+    Eigen::VectorXd measured = Eigen::VectorXd::Zero(status.joint_angle.size());
     for (Eigen::Index i = 0; i < status.joint_angle.size(); ++i)
     {
-      command_pos[i] = alpha * command[i] + (1.0 - alpha) * last_command[i];
+      measured[i] = static_cast<double>(status.joint_angle[i]);
     }
 
-    // Handle IO commands.
+    const double override_scale = std::max(static_cast<double>(status.safety_scale), 0.01);
+    const double v_peak = stream_v_peak_.load(std::memory_order_relaxed) * override_scale;
+    refreshStreamInterpolatorLimits(v_peak, stream_limit_payload_);
+
+    const Eigen::VectorXd command = commandPoseForStream(measured, dt_s);
+    for (Eigen::Index i = 0; i < command.size(); ++i)
+    {
+      command_pos[i] = command[i];
+    }
+
     while (p_queue_impl_->command_io_queue_.try_dequeue(command_io)) {}
 
+    // Last host-side command + measured before the UDP socket write.
+    recordOutgoingCommandForPlot(measured);
     stream_motion_->sendCommand(command_pos, !is_streaming_, command_io, ((motion_possible && do_motn_ctrl_) ? 1 : 0));
     p_queue_impl_->robot_state_queue_.enqueue(status);
   }
@@ -438,7 +402,8 @@ bool FanucClient::getLimits(const double v_peak, const double payload, std::vect
   const double pct = (std::min)((std::max)(num * denom, 0.0) * 19.0, 19.0);
   const int idx_l = (std::max)(static_cast<int>(pct), 0);
   const int idx_u = (std::min)(static_cast<int>(ceil(pct)), 19);
-  const double idx_frac = pct - static_cast<double>(pct);
+  // Fractional blend between adjacent table columns (idx_l truncates pct toward zero).
+  const double idx_frac = pct - static_cast<double>(idx_l);
   Eigen::VectorXd vel_limit_no_load =
       idx_frac * (vel_limits_no_load_.col(idx_u) - vel_limits_no_load_.col(idx_l)) + vel_limits_no_load_.col(idx_l);
   Eigen::VectorXd acc_limit_no_load =
@@ -465,6 +430,74 @@ bool FanucClient::getLimits(const double v_peak, const double payload, std::vect
     jerk_limit[i] = payload_pct * (jerk_limit_full_load[i] - jerk_limit_no_load[i]) + jerk_limit_no_load[i];
   }
   return true;
+}
+
+void FanucClient::setStreamVPeak(const double v_peak)
+{
+  const double clamped = std::max(1.0, std::min(v_peak, 2000.0));
+  stream_v_peak_.store(clamped, std::memory_order_relaxed);
+}
+
+double FanucClient::getStreamVPeak() const
+{
+  return stream_v_peak_.load(std::memory_order_relaxed);
+}
+
+void FanucClient::setMaxCommandStepDeg(const double max_step_deg)
+{
+  // <= 0 disables the absolute step cap inside the OTG.
+  max_command_step_deg_.store(max_step_deg, std::memory_order_relaxed);
+}
+
+double FanucClient::getMaxCommandStepDeg() const
+{
+  return max_command_step_deg_.load(std::memory_order_relaxed);
+}
+
+void FanucClient::refreshStreamInterpolatorLimits(const double v_peak, const double payload)
+{
+  stream_limit_payload_ = payload;
+  std::vector<double> vel_limit;
+  std::vector<double> acc_limit;
+  std::vector<double> jerk_limit;
+  getLimits(v_peak, payload, vel_limit, acc_limit, jerk_limit);
+  stream_interpolator_.setLimits(vel_limit, acc_limit, jerk_limit, kInterpolationSafetyScale);
+  stream_interpolator_.setMaxPositionStepDeg(max_command_step_deg_.load(std::memory_order_relaxed));
+}
+
+Eigen::VectorXd FanucClient::commandPoseForStream(const Eigen::VectorXd& measured, const double dt_s)
+{
+  if (prime_remaining_ > 0)
+  {
+    --prime_remaining_;
+    stream_interpolator_.reset(measured);
+    return measured;
+  }
+
+  if (!do_motn_ctrl_)
+  {
+    stream_interpolator_.reset(measured);
+    return measured;
+  }
+
+  Eigen::VectorXd goal = measured;
+  bool has_goal = false;
+  {
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    if (command_target_valid_)
+    {
+      goal = command_target_;
+      has_goal = true;
+    }
+  }
+
+  if (!has_goal)
+  {
+    stream_interpolator_.reset(measured);
+    return measured;
+  }
+
+  return stream_interpolator_.step(goal, dt_s);
 }
 
 void FanucClient::startRMI()
@@ -495,8 +528,7 @@ void FanucClient::startRMI()
   }
   catch (const std::runtime_error& e)
   {
-    throw std::runtime_error("Failed to get RMI status");
-    return;
+    throw std::runtime_error(std::string("Failed to get RMI status: ") + e.what());
   }
 
   try
@@ -560,7 +592,6 @@ bool FanucClient::startMotionControl()
         readStateFromQueue();
         if (robot_status_.motion_possible)
         {
-          do_motn_ctrl_ = true;
           break;
         }
       }
@@ -650,7 +681,6 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
       }
     }
   }
-  start_time_ = std::chrono::high_resolution_clock::now();
   p_queue_impl_->robot_state_queue_.enqueue(status);
   is_streaming_ = true;
   last_joint_angles_ = Eigen::VectorXd::Zero(status.joint_angle.size());
@@ -659,6 +689,13 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
     last_joint_angles_[i] = static_cast<double>(status.joint_angle[i]);
     command_pos[i] = static_cast<double>(status.joint_angle[i]);
   }
+  {
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    command_target_ = last_joint_angles_;
+    command_target_valid_ = true;
+  }
+  stream_interpolator_.reset(last_joint_angles_);
+  recordOutgoingCommandForPlot(last_joint_angles_);
   stream_motion_->sendCommand(command_pos, false, {}, (do_motn_ctrl_ ? 1 : 0));
 
   if (rt_thread_.joinable())
@@ -713,6 +750,134 @@ uint32_t FanucClient::getControlPeriod() const
 void FanucClient::setPayloadSchedule(const uint8_t payload_schedule) const
 {
   rmi_connection_->setPayloadSchedule(payload_schedule, std::nullopt);
+}
+
+void FanucClient::resetController() const
+{
+  rmi_connection_->reset(std::nullopt);
+}
+
+std::string FanucClient::readControllerErrors() const
+{
+  try
+  {
+    const auto response = rmi_connection_->readError(std::nullopt);
+    std::string message = response.ErrorData;
+    if (response.ErrorData2.has_value() && !response.ErrorData2->empty())
+    {
+      message += "; " + response.ErrorData2.value();
+    }
+    if (response.ErrorData3.has_value() && !response.ErrorData3->empty())
+    {
+      message += "; " + response.ErrorData3.value();
+    }
+    if (response.ErrorData4.has_value() && !response.ErrorData4->empty())
+    {
+      message += "; " + response.ErrorData4.value();
+    }
+    if (response.ErrorData5.has_value() && !response.ErrorData5->empty())
+    {
+      message += "; " + response.ErrorData5.value();
+    }
+    if (message.empty())
+    {
+      return "no active alarm";
+    }
+    return message;
+  }
+  catch (const std::exception& e)
+  {
+    return std::string("readError failed: ") + e.what();
+  }
+}
+
+void FanucClient::resetStreamCommandToMeasured()
+{
+  AssertIsStreaming(is_streaming_);
+  readStateFromQueue();
+
+  last_joint_angles_cmd_ = last_joint_angles_;
+  {
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    command_target_ = last_joint_angles_;
+    command_target_valid_ = true;
+  }
+
+  // The RT thread sends command_pos every cycle. If it still holds a stale
+  // target when do_motn_ctrl turns on, the controller faults with MOTN-017.
+  for (Eigen::Index i = 0; i < last_joint_angles_.size(); ++i)
+  {
+    command_pos[i] = last_joint_angles_[i];
+  }
+  stream_interpolator_.reset(last_joint_angles_);
+}
+
+void FanucClient::setCommandPlotEnabled(const bool enabled)
+{
+#if defined(FANUC_CLIENT_COMMAND_PLOT)
+  if (enabled == command_plot_enabled_.load(std::memory_order_acquire))
+  {
+    return;
+  }
+
+  if (enabled)
+  {
+    command_plot_t0_ = std::chrono::steady_clock::now();
+    // Drain any stale samples before starting the UI thread.
+    JointCommandSample discarded;
+    while (p_queue_impl_->command_plot_queue_.try_dequeue(discarded)) {}
+    const char* csv_env = std::getenv("FANUC_COMMAND_PLOT_CSV");
+    const std::string csv_path = (csv_env != nullptr && csv_env[0] != '\0') ? std::string(csv_env) : std::string();
+    command_plotter_ =
+        std::make_unique<JointCommandPlotter>(p_queue_impl_->command_plot_queue_, 6, 10.0, csv_path);
+    command_plot_enabled_.store(true, std::memory_order_release);
+    command_plotter_->start();
+    std::cout << "FanucClient: command plotter enabled, CSV -> " << command_plotter_->csvPath() << std::endl;
+  }
+  else
+  {
+    command_plot_enabled_.store(false, std::memory_order_release);
+    if (command_plotter_)
+    {
+      command_plotter_->stop();
+      command_plotter_.reset();
+    }
+  }
+#else
+  command_plot_enabled_.store(false, std::memory_order_release);
+  if (enabled)
+  {
+    std::cerr << "FanucClient::setCommandPlotEnabled: built without FANUC_CLIENT_COMMAND_PLOT" << std::endl;
+  }
+#endif
+}
+
+void FanucClient::recordOutgoingCommandForPlot(const Eigen::VectorXd& measured)
+{
+  if (!command_plot_enabled_.load(std::memory_order_acquire))
+  {
+    return;
+  }
+
+  JointCommandSample sample;
+  sample.t_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - command_plot_t0_).count();
+  sample.command = command_pos;
+  for (Eigen::Index i = 0; i < measured.size() && i < stream_motion::kMaxAxisNumber; ++i)
+  {
+    sample.measured[static_cast<std::size_t>(i)] = measured[i];
+  }
+  // Non-blocking: drop sample if the plotter has fallen behind.
+  (void)p_queue_impl_->command_plot_queue_.try_enqueue(sample);
+}
+
+void FanucClient::setDoMotnCtrl(const bool do_motn_ctrl)
+{
+  if (do_motn_ctrl && !do_motn_ctrl_ && is_streaming_)
+  {
+    resetStreamCommandToMeasured();
+    prime_remaining_ = kStreamHoldPrimeCycles;
+  }
+  do_motn_ctrl_ = do_motn_ctrl;
 }
 
 void FanucClient::validateGPIOBuffer(const std::shared_ptr<GPIOBuffer>& gpio_buffer) const

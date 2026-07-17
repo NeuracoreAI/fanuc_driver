@@ -5,7 +5,11 @@
 
 #pragma once
 
+#include <atomic>
+#include <array>
+#include <chrono>
 #include <csignal>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -14,11 +18,14 @@
 #include <Eigen/Core>
 
 #include "fanuc_client/gpio_buffer.hpp"
+#include "fanuc_client/joint_stream_interpolator.hpp"
 #include "rmi/rmi.hpp"
 #include "stream_motion/stream.hpp"
 
 namespace fanuc_client
 {
+
+class JointCommandPlotter;
 
 enum class ContactStopMode
 {
@@ -93,29 +100,51 @@ public:
     return do_motn_ctrl_;
   }
 
-  void setDoMotnCtrl(const bool do_motn_ctrl)
-  {
-    do_motn_ctrl_ = do_motn_ctrl;
-  }
+  void setDoMotnCtrl(bool do_motn_ctrl);
 
   bool getLimits(double v_peak, double payload, std::vector<double>& vel_limit, std::vector<double>& acc_limit,
                  std::vector<double>& jerk_limit) const;
+
+  /**
+   * Base v_peak used to index robot threshold tables for the stream OTG.
+   * Each control cycle uses ``getStreamVPeak() * safety_scale`` from the status packet.
+   * Valid range roughly 100..2000 (FANUC table scale).
+   */
+  void setStreamVPeak(double v_peak);
+  double getStreamVPeak() const;
+
+  /**
+   * Hard |Δq| cap (degrees) applied to each OTG command cycle.
+   * Set <= 0 to disable the absolute step cap (not recommended).
+   */
+  void setMaxCommandStepDeg(double max_step_deg);
+  double getMaxCommandStepDeg() const;
 
   uint32_t getControlPeriod() const;
 
   void setPayloadSchedule(uint8_t payload_schedule) const;
 
+  /** Send FRC_Reset over RMI — clears controller faults (same as TP RESET). */
+  void resetController() const;
+
+  /** Read active controller alarm text via RMI (FRC_ReadError). */
+  std::string readControllerErrors() const;
+
+  /** Re-seed the command buffer from measured joints. */
+  void resetStreamCommandToMeasured();
+
+  /**
+   * Enable/disable the live C++ ImPlot window of pre-socket joint commands.
+   * RT thread only try_enqueues samples; a separate thread renders.
+   */
+  void setCommandPlotEnabled(bool enabled);
+
+  bool isCommandPlotEnabled() const
+  {
+    return command_plot_enabled_.load(std::memory_order_acquire);
+  }
+
   void validateGPIOBuffer(const std::shared_ptr<GPIOBuffer>& gpio_buffer) const;
-
-  void setOutCmdInterpBuffTarget(uint32_t out_cmd_interp_buff_target)
-  {
-    out_cmd_interp_buff_target_ = out_cmd_interp_buff_target;
-  }
-
-  uint32_t getOutCmdInterpBuffTarget() const
-  {
-    return out_cmd_interp_buff_target_;
-  }
 
   void setForceSensorType(uint32_t force_sensor_type)
   {
@@ -179,6 +208,14 @@ private:
   /** Grab the limits from the robot.*/
   void fetchRobotLimits();
 
+  /** Refresh OTG limits from cached threshold tables (override + payload). */
+  void refreshStreamInterpolatorLimits(double v_peak, double payload);
+
+  Eigen::VectorXd commandPoseForStream(const Eigen::VectorXd& measured, double dt_s);
+
+  /** Non-blocking enqueue of command + measured for the plotter (no-op if disabled). */
+  void recordOutgoingCommandForPlot(const Eigen::VectorXd& measured);
+
   const std::string robot_ip_;
   const uint16_t stream_motion_port_;
   const uint16_t rmi_port_;
@@ -193,10 +230,24 @@ private:
 
   // Manages stream motion connection
   std::atomic<bool> is_streaming_ = false;
-  std::chrono::time_point<std::chrono::high_resolution_clock> start_time_;
   std::unique_ptr<stream_motion::StreamMotionInterface> stream_motion_;
 
   std::array<double, stream_motion::kMaxAxisNumber> command_pos;
+  std::mutex command_mutex_;
+  Eigen::VectorXd command_target_ = Eigen::VectorXd::Zero(9);
+  bool command_target_valid_{ false };
+  JointStreamInterpolator stream_interpolator_{ stream_motion::kMaxAxisNumber };
+  int prime_remaining_{ 0 };
+  static constexpr int kStreamHoldPrimeCycles = 8;
+  /** Safety scale applied on top of robot threshold-table limits. */
+  static constexpr double kInterpolationSafetyScale = 0.8;
+  /** Default threshold-table index scale (FANUC tables top out near 2000). */
+  static constexpr double kDefaultStreamVPeak = 400.0;
+  /** Default hard |Δq| cap (deg) per control period. */
+  static constexpr double kDefaultMaxCommandStepDeg = 2.0;
+  std::atomic<double> stream_v_peak_{ kDefaultStreamVPeak };
+  std::atomic<double> max_command_step_deg_{ kDefaultMaxCommandStepDeg };
+  double stream_limit_payload_{ 0.0 };
   Eigen::VectorXd last_joint_angles_ = Eigen::VectorXd::Zero(9);
   Eigen::VectorXd last_joint_angles_cmd_ = Eigen::VectorXd::Zero(9);
   RobotStatus robot_status_;
@@ -217,11 +268,15 @@ private:
   std::shared_ptr<rmi::RMIConnectionInterface> rmi_connection_;
   std::atomic<bool> rmi_running_ = false;
 
-  // Output command interpolation buffer target size for stream motion control
-  uint32_t out_cmd_interp_buff_target_;
-
   // Force sensor default type
   uint32_t force_sensor_type_;
+
+  // Live pre-socket command plotter (optional; see FANUC_CLIENT_COMMAND_PLOT).
+  std::atomic<bool> command_plot_enabled_{ false };
+  std::chrono::steady_clock::time_point command_plot_t0_{};
+#if defined(FANUC_CLIENT_COMMAND_PLOT)
+  std::unique_ptr<JointCommandPlotter> command_plotter_;
+#endif
 
   struct PQueueImpl;
   std::unique_ptr<PQueueImpl> p_queue_impl_;

@@ -3,6 +3,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <chrono>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <thread>
@@ -195,15 +196,20 @@ TEST(FanucClientTest, TestSuccessfulLifecycle)
   Eigen::VectorXd joint_states = fanuc_client.readJointAngles();
   EXPECT_EQ(joint_states, initial_joint_targets);
 
-  // Writing joint targets should update the joint states eventually
+  // Writing joint targets should update the joint states eventually (via OTG)
   Eigen::VectorXd joint_targets = joint_states.array() + 1.0;
-  while (joint_states == initial_joint_targets)
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while ((joint_states - joint_targets).cwiseAbs().maxCoeff() > 0.05)
   {
     fanuc_client.writeJointTarget(joint_targets);
     joint_states = fanuc_client.readJointAngles();
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline);
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  EXPECT_EQ(joint_targets, joint_states);
+  for (int i = 0; i < stream_motion::kMaxAxisNumber; ++i)
+  {
+    EXPECT_NEAR(joint_states[i], joint_targets[i], 0.05);
+  }
 
   // Stop the real-time stream should disconnect the stream
   fanuc_client.stopRealtimeStream();

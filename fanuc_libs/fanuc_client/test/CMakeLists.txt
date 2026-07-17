@@ -7,6 +7,10 @@ add_executable(fanuc_client_test fanuc_client_test.cpp)
 target_link_libraries(fanuc_client_test PRIVATE fanuc_client GTest::gtest_main GTest::gmock_main)
 gtest_discover_tests(fanuc_client_test)
 
+add_executable(joint_stream_interpolator_test joint_stream_interpolator_test.cpp)
+target_link_libraries(joint_stream_interpolator_test PRIVATE fanuc_client GTest::gtest_main)
+gtest_discover_tests(joint_stream_interpolator_test)
+
 add_executable(gpio_buffer_test gpio_buffer_test.cpp)
 target_link_libraries(gpio_buffer_test PRIVATE fanuc_client GTest::gtest_main GTest::gmock_main)
 gtest_discover_tests(gpio_buffer_test)
