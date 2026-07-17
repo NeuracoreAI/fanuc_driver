@@ -454,6 +454,12 @@ double FanucClient::getMaxCommandStepDeg() const
   return max_command_step_deg_.load(std::memory_order_relaxed);
 }
 
+void FanucClient::setJointPositionLimits(const std::vector<double>& lower_deg,
+                                         const std::vector<double>& upper_deg)
+{
+  stream_interpolator_.setPositionLimits(lower_deg, upper_deg);
+}
+
 void FanucClient::refreshStreamInterpolatorLimits(const double v_peak, const double payload)
 {
   stream_limit_payload_ = payload;
