@@ -12,6 +12,30 @@ option(FANUC_CLIENT_COMMAND_PLOT "Build live ImGui/ImPlot pre-socket command plo
 # Find dependencies
 find_package(Eigen3 REQUIRED)
 
+include(FetchContent)
+
+# Jerk-limited online trajectory generator (OTG) for stream command shaping.
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
+set(BUILD_PYTHON_MODULE OFF CACHE BOOL "" FORCE)
+set(BUILD_ONLINE_CLIENT OFF CACHE BOOL "" FORCE)
+# Build Ruckig static + PIC so it embeds into libfanuc_client.so.
+set(_FANUC_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  ruckig
+  GIT_REPOSITORY https://github.com/pantor/ruckig.git
+  GIT_TAG v0.9.2
+)
+FetchContent_MakeAvailable(ruckig)
+set_property(TARGET ruckig PROPERTY POSITION_INDEPENDENT_CODE ON)
+if(DEFINED _FANUC_SAVED_BUILD_SHARED_LIBS)
+  set(BUILD_SHARED_LIBS ${_FANUC_SAVED_BUILD_SHARED_LIBS} CACHE BOOL "" FORCE)
+else()
+  unset(BUILD_SHARED_LIBS CACHE)
+endif()
+
 set(FANUC_CLIENT_SOURCES
     src/fanuc_client.cpp
     src/gpio_buffer.cpp
@@ -26,15 +50,13 @@ endif()
 add_library(fanuc_client SHARED ${FANUC_CLIENT_SOURCES})
 set_target_properties(fanuc_client PROPERTIES CXX_STANDARD 17)
 target_link_libraries(fanuc_client PUBLIC stream_motion rmi Eigen3::Eigen)
-target_link_libraries(fanuc_client PRIVATE readerwriterqueue)
+target_link_libraries(fanuc_client PRIVATE readerwriterqueue ruckig)
 target_include_directories(fanuc_client PUBLIC
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 
 if(FANUC_CLIENT_COMMAND_PLOT)
-  include(FetchContent)
-
   find_package(OpenGL REQUIRED)
 
   # Static GLFW so libfanuc_client.so does not need libglfw.so at runtime.

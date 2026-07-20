@@ -121,7 +121,7 @@ public:
   double getMaxCommandStepDeg() const;
 
   /**
-   * Per-axis soft position envelope (degrees) for the stream command.
+   * Per-axis soft position envelope (degrees) for the stream OTG command.
    * Empty vectors disable clamping.  Prevents MOTN-017 when goals exceed
    * controller soft limits that are tighter than the URDF.
    */

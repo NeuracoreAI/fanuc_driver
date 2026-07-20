@@ -35,29 +35,6 @@ double maxStep(const Eigen::VectorXd& prev, const Eigen::VectorXd& next)
 
 }  // namespace
 
-TEST(JointStreamInterpolatorTest, SmoothstepMatchesQuinticFormula)
-{
-  // s(t) = 6t^5 - 15t^4 + 10t^3
-  EXPECT_NEAR(JointStreamInterpolator::smoothstepQuintic(0.0), 0.0, 1e-12);
-  EXPECT_NEAR(JointStreamInterpolator::smoothstepQuintic(1.0), 1.0, 1e-12);
-  EXPECT_NEAR(JointStreamInterpolator::smoothstepQuintic(0.5), 0.5, 1e-12);
-
-  const double t = 0.3;
-  const double expected = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
-  EXPECT_NEAR(JointStreamInterpolator::smoothstepQuintic(t), expected, 1e-12);
-
-  // Zero slope at endpoints (minimum-jerk / S-curve property).
-  const double eps = 1e-6;
-  const double ds0 = (JointStreamInterpolator::smoothstepQuintic(eps) -
-                      JointStreamInterpolator::smoothstepQuintic(0.0)) /
-                     eps;
-  const double ds1 = (JointStreamInterpolator::smoothstepQuintic(1.0) -
-                      JointStreamInterpolator::smoothstepQuintic(1.0 - eps)) /
-                     eps;
-  EXPECT_NEAR(ds0, 0.0, 1e-4);
-  EXPECT_NEAR(ds1, 0.0, 1e-4);
-}
-
 TEST(JointStreamInterpolatorTest, ReachesStaticGoal)
 {
   auto interpolator = makeInterpolator();
@@ -68,7 +45,7 @@ TEST(JointStreamInterpolatorTest, ReachesStaticGoal)
 
   const Eigen::VectorXd goal = Eigen::VectorXd::Zero(6);
   Eigen::VectorXd cmd = start;
-  for (int i = 0; i < 5000; ++i)
+  for (int i = 0; i < 20000; ++i)
   {
     cmd = interpolator.step(goal, kDt);
   }
@@ -79,43 +56,8 @@ TEST(JointStreamInterpolatorTest, ReachesStaticGoal)
   }
 }
 
-TEST(JointStreamInterpolatorTest, RestToRestFollowsQuinticShape)
-{
-  // Committed rest-to-rest segment should track s(τ)*dq closely.
-  JointStreamInterpolator interpolator(1);
-  interpolator.setLimits({ 200.0 }, { 2000.0 }, { 20000.0 }, 1.0);
-  interpolator.setMaxPositionStepDeg(50.0);  // do not distort the S-curve shape
-
-  const double dq = 40.0;
-  Eigen::VectorXd start = Eigen::VectorXd::Zero(1);
-  interpolator.reset(start);
-  const Eigen::VectorXd goal = Eigen::VectorXd::Constant(1, dq);
-
-  // Duration from v/a/j peaks (same policy as the interpolator).
-  const double T_v = 1.875 * dq / 200.0;
-  const double T_a = std::sqrt(5.77350269189 * dq / 2000.0);
-  const double T_j = std::cbrt(60.0 * dq / 20000.0);
-  const double T = std::max({ T_v, T_a, T_j, kDt });
-
-  double t = 0.0;
-  Eigen::VectorXd cmd = start;
-  for (int i = 0; i < 20; ++i)
-  {
-    cmd = interpolator.step(goal, kDt);
-    t += kDt;
-    if (t > T)
-    {
-      break;
-    }
-    const double tau = t / T;
-    const double expected = JointStreamInterpolator::smoothstepQuintic(tau) * dq;
-    EXPECT_NEAR(cmd[0], expected, 1e-6) << "i=" << i << " t=" << t;
-  }
-}
-
 TEST(JointStreamInterpolatorTest, StaticGoalRespectsVelocityAccelJerkLimits)
 {
-  // Large home-like move: committed S-curve must keep finite-diff peaks inside limits.
   constexpr double kVmax = 80.0;
   constexpr double kAmax = 800.0;
   constexpr double kJmax = 8000.0;
@@ -123,7 +65,7 @@ TEST(JointStreamInterpolatorTest, StaticGoalRespectsVelocityAccelJerkLimits)
 
   JointStreamInterpolator interpolator(1);
   interpolator.setLimits({ kVmax }, { kAmax }, { kJmax }, 1.0);
-  interpolator.setMaxPositionStepDeg(2.0);
+  interpolator.setMaxPositionStepDeg(50.0);  // do not hide OTG limits behind step cap
 
   Eigen::VectorXd start = Eigen::VectorXd::Zero(1);
   start[0] = 90.0;
@@ -199,12 +141,59 @@ TEST(JointStreamInterpolatorTest, InterruptibleGoalChange)
   }
   EXPECT_GT(cmd[0], 5.0);
 
-  for (int i = 0; i < 5000; ++i)
+  for (int i = 0; i < 20000; ++i)
   {
     cmd = interpolator.step(goal_b, kDt);
   }
   EXPECT_NEAR(cmd[0], goal_b[0], 0.1);
   EXPECT_LT(cmd[0], 0.0);
+}
+
+TEST(JointStreamInterpolatorTest, ContinuousRetargetingStaysSmooth)
+{
+  // Rapidly changing goals (teleop-like): finite-diff jerk must stay near limits.
+  constexpr double kVmax = 100.0;
+  constexpr double kAmax = 1000.0;
+  constexpr double kJmax = 10000.0;
+  constexpr double kSlack = 1.15;  // finite-diff on discrete samples is slightly noisy
+
+  JointStreamInterpolator interpolator(1);
+  interpolator.setLimits({ kVmax }, { kAmax }, { kJmax }, 1.0);
+  interpolator.setMaxPositionStepDeg(5.0);
+
+  Eigen::VectorXd start = Eigen::VectorXd::Zero(1);
+  interpolator.reset(start);
+
+  Eigen::VectorXd prev = start;
+  double prev_v = 0.0;
+  double prev_a = 0.0;
+  double peak_j = 0.0;
+
+  for (int i = 0; i < 500; ++i)
+  {
+    Eigen::VectorXd goal = Eigen::VectorXd::Zero(1);
+    // Sweep a moving setpoint that reverses a few times.
+    const double phase = static_cast<double>(i) * 0.05;
+    goal[0] = 30.0 * std::sin(phase);
+    if (i > 200 && i < 280)
+    {
+      goal[0] = -40.0;
+    }
+
+    const Eigen::VectorXd cmd = interpolator.step(goal, kDt);
+    const double v = (cmd[0] - prev[0]) / kDt;
+    const double a = (v - prev_v) / kDt;
+    const double j = (a - prev_a) / kDt;
+    if (i > 2)
+    {
+      peak_j = std::max(peak_j, std::abs(j));
+    }
+    prev = cmd;
+    prev_v = v;
+    prev_a = a;
+  }
+
+  EXPECT_LE(peak_j, kJmax * kSlack);
 }
 
 TEST(JointStreamInterpolatorTest, ResetClearsVelocity)
@@ -241,7 +230,7 @@ TEST(JointStreamInterpolatorTest, LargeGoalDoesNotTeleportInOneTick)
   const Eigen::VectorXd goal = Eigen::VectorXd::Zero(6);
   const Eigen::VectorXd next = interpolator.step(goal, kDt);
   EXPECT_LE(std::abs(next[0] - start[0]), 2.0 + 1e-9);
-  EXPECT_LT(next[0], start[0]);  // moving toward 0
+  EXPECT_LT(next[0], start[0]);
 }
 
 TEST(JointStreamInterpolatorTest, DoesNotCrossGoalFasterThanStepCap)
@@ -263,10 +252,9 @@ TEST(JointStreamInterpolatorTest, DoesNotCrossGoalFasterThanStepCap)
   }
 }
 
-TEST(JointStreamInterpolatorTest, SCurveStartsSlowlyFromRest)
+TEST(JointStreamInterpolatorTest, StartsSlowlyFromRest)
 {
-  // Quintic S-curve has s'(0)=0, so the first ticks from rest are much smaller
-  // than a linear interpolator step (which would take ~vmax*dt immediately).
+  // Jerk-limited OTG from rest: early |Δq| grows gradually, not vmax*dt on tick 0.
   JointStreamInterpolator interpolator(1);
   interpolator.setLimits({ 120.0 }, { 1200.0 }, { 12000.0 }, 1.0);
   interpolator.setMaxPositionStepDeg(10.0);
