@@ -120,6 +120,13 @@ public:
   void setMaxCommandStepDeg(double max_step_deg);
   double getMaxCommandStepDeg() const;
 
+  /**
+   * Per-axis soft position envelope (degrees) for the stream command.
+   * Empty vectors disable clamping.  Prevents MOTN-017 when goals exceed
+   * controller soft limits that are tighter than the URDF.
+   */
+  void setJointPositionLimits(const std::vector<double>& lower_deg, const std::vector<double>& upper_deg);
+
   uint32_t getControlPeriod() const;
 
   void setPayloadSchedule(uint8_t payload_schedule) const;

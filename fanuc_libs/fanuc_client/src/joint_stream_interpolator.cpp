@@ -97,6 +97,38 @@ void JointStreamInterpolator::setMaxPositionStepDeg(const double max_step_deg)
   max_position_step_deg_ = max_step_deg;
 }
 
+void JointStreamInterpolator::setPositionLimits(const std::vector<double>& lower_deg,
+                                                const std::vector<double>& upper_deg)
+{
+  if (lower_deg.empty() || upper_deg.empty())
+  {
+    position_limits_enabled_ = false;
+    position_lower_.clear();
+    position_upper_.clear();
+    return;
+  }
+
+  position_lower_.assign(static_cast<size_t>(n_joints_), -1.0e9);
+  position_upper_.assign(static_cast<size_t>(n_joints_), 1.0e9);
+  for (int i = 0; i < n_joints_; ++i)
+  {
+    const double lo = i < static_cast<int>(lower_deg.size()) ? lower_deg[static_cast<size_t>(i)] : -1.0e9;
+    const double hi = i < static_cast<int>(upper_deg.size()) ? upper_deg[static_cast<size_t>(i)] : 1.0e9;
+    position_lower_[static_cast<size_t>(i)] = std::min(lo, hi);
+    position_upper_[static_cast<size_t>(i)] = std::max(lo, hi);
+  }
+  position_limits_enabled_ = true;
+}
+
+double JointStreamInterpolator::clampPosition(const int i, const double q) const
+{
+  if (!position_limits_enabled_)
+  {
+    return q;
+  }
+  return clampDouble(q, position_lower_[static_cast<size_t>(i)], position_upper_[static_cast<size_t>(i)]);
+}
+
 Eigen::VectorXd JointStreamInterpolator::command() const
 {
   Eigen::VectorXd out = Eigen::VectorXd::Zero(n_joints_);
@@ -244,7 +276,8 @@ bool JointStreamInterpolator::goalChanged(const Eigen::VectorXd& target) const
   }
   for (int i = 0; i < n_joints_; ++i)
   {
-    const double goal = i < target.size() ? target[i] : axes_[static_cast<std::size_t>(i)].position;
+    const double raw_goal = i < target.size() ? target[i] : axes_[static_cast<std::size_t>(i)].position;
+    const double goal = clampPosition(i, raw_goal);
     if (std::abs(goal - segment_.goal[static_cast<std::size_t>(i)]) > kGoalChangeToleranceDeg)
     {
       return true;
@@ -261,7 +294,8 @@ void JointStreamInterpolator::planSegment(const Eigen::VectorXd& target, const d
   for (int i = 0; i < n_joints_; ++i)
   {
     const auto& axis = axes_[static_cast<std::size_t>(i)];
-    const double goal = i < target.size() ? target[i] : axis.position;
+    const double raw_goal = i < target.size() ? target[i] : axis.position;
+    const double goal = clampPosition(i, raw_goal);
     segment_.goal[static_cast<std::size_t>(i)] = goal;
 
     if (std::abs(goal - axis.position) > kPositionToleranceDeg || std::abs(axis.velocity) > kVelocityToleranceDegS ||
@@ -355,7 +389,8 @@ Eigen::VectorXd JointStreamInterpolator::step(const Eigen::VectorXd& target, con
   {
     for (int i = 0; i < n_joints_; ++i)
     {
-      const double goal = i < target.size() ? target[i] : axes_[static_cast<std::size_t>(i)].position;
+      const double raw_goal = i < target.size() ? target[i] : axes_[static_cast<std::size_t>(i)].position;
+      const double goal = clampPosition(i, raw_goal);
       axes_[static_cast<std::size_t>(i)].position = goal;
       axes_[static_cast<std::size_t>(i)].velocity = 0.0;
       axes_[static_cast<std::size_t>(i)].acceleration = 0.0;
@@ -367,6 +402,7 @@ Eigen::VectorXd JointStreamInterpolator::step(const Eigen::VectorXd& target, con
   segment_.t = std::min(segment_.t + dt, segment_.T);
   const bool finished = segment_.t >= segment_.T - 1e-12;
   bool step_cap_clipped = false;
+  bool position_limit_clipped = false;
 
   for (int i = 0; i < n_joints_; ++i)
   {
@@ -405,6 +441,13 @@ Eigen::VectorXd JointStreamInterpolator::step(const Eigen::VectorXd& target, con
     {
       x = std::max(x, goal);
     }
+
+    const double limited = clampPosition(i, x);
+    if (std::abs(limited - x) > 1e-12)
+    {
+      x = limited;
+      position_limit_clipped = true;
+    }
     delta = x - axis.position;
 
     if (std::abs(goal - x) < kPositionToleranceDeg)
@@ -413,9 +456,11 @@ Eigen::VectorXd JointStreamInterpolator::step(const Eigen::VectorXd& target, con
       axis.velocity = 0.0;
       axis.acceleration = 0.0;
     }
-    else if (max_position_step_deg_ > 0.0 && std::abs(delta) >= max_position_step_deg_ - 1e-9)
+    else if (position_limit_clipped ||
+             (max_position_step_deg_ > 0.0 && std::abs(delta) >= max_position_step_deg_ - 1e-9))
     {
-      // Step cap clipped the committed profile — keep state consistent; replan next tick.
+      // Soft limit or step cap clipped the committed profile — keep state
+      // consistent; replan next tick.
       axis.position = x;
       axis.velocity = delta / dt;
       axis.acceleration = 0.0;

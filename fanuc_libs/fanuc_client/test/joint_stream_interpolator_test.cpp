@@ -289,4 +289,34 @@ TEST(JointStreamInterpolatorTest, SCurveStartsSlowlyFromRest)
   EXPECT_GT(steps[9], steps[3]);
 }
 
+TEST(JointStreamInterpolatorTest, PositionLimitsClampGoalAndCommand)
+{
+  JointStreamInterpolator interpolator(1);
+  interpolator.setLimits({ 200.0 }, { 2000.0 }, { 20000.0 }, 1.0);
+  interpolator.setMaxPositionStepDeg(50.0);
+  interpolator.setPositionLimits({ -10.0 }, { 10.0 });
+
+  Eigen::VectorXd start = Eigen::VectorXd::Zero(1);
+  interpolator.reset(start);
+
+  Eigen::VectorXd goal = Eigen::VectorXd::Constant(1, 90.0);
+  Eigen::VectorXd cmd = start;
+  for (int i = 0; i < 5000; ++i)
+  {
+    cmd = interpolator.step(goal, kDt);
+    EXPECT_LE(cmd[0], 10.0 + 1e-6);
+    EXPECT_GE(cmd[0], -10.0 - 1e-6);
+  }
+  EXPECT_NEAR(cmd[0], 10.0, 0.05);
+
+  goal[0] = -90.0;
+  for (int i = 0; i < 5000; ++i)
+  {
+    cmd = interpolator.step(goal, kDt);
+    EXPECT_LE(cmd[0], 10.0 + 1e-6);
+    EXPECT_GE(cmd[0], -10.0 - 1e-6);
+  }
+  EXPECT_NEAR(cmd[0], -10.0, 0.05);
+}
+
 }  // namespace fanuc_client

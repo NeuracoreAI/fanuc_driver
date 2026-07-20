@@ -53,6 +53,13 @@ public:
     return max_position_step_deg_;
   }
 
+  /**
+   * Per-axis soft position envelope (degrees).  Goals and command samples are
+   * clamped into [lower, upper] to avoid MOTN-017 soft-limit faults.
+   * Pass empty vectors (or call with both empty) to disable.
+   */
+  void setPositionLimits(const std::vector<double>& lower_deg, const std::vector<double>& upper_deg);
+
   /** Advance one control cycle toward *target* and return the command pose (deg). */
   Eigen::VectorXd step(const Eigen::VectorXd& target, double dt_s);
 
@@ -116,11 +123,15 @@ private:
   bool goalChanged(const Eigen::VectorXd& target) const;
   void clearSegment();
   void planSegment(const Eigen::VectorXd& target, double dt);
+  double clampPosition(int i, double q) const;
 
   int n_joints_;
   std::vector<AxisState> axes_;
   Segment segment_;
   double max_position_step_deg_{ 2.0 };
+  bool position_limits_enabled_{ false };
+  std::vector<double> position_lower_;
+  std::vector<double> position_upper_;
 };
 
 }  // namespace fanuc_client
