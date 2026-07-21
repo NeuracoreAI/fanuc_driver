@@ -204,8 +204,8 @@ private:
   /** Mutex to protect instance_ access from signal handler */
   static std::mutex instance_mutex_;
 
-  /** Previous signal handler to restore */
-  static struct sigaction previous_sigaction_;
+  /** Previous SIGINT handler to restore (portable; avoids POSIX sigaction) */
+  static void (*previous_signal_handler_)(int);
 
 private:
   void readStateFromQueue();

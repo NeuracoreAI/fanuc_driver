@@ -29,7 +29,7 @@ namespace fanuc_client
 // Static member initialization
 FanucClient* FanucClient::instance_ = nullptr;
 std::mutex FanucClient::instance_mutex_;
-struct sigaction FanucClient::previous_sigaction_;
+void (*FanucClient::previous_signal_handler_)(int) = nullptr;
 
 namespace
 {
@@ -920,12 +920,7 @@ void FanucClient::setupSignalHandler()
 {
   std::lock_guard<std::mutex> lock(instance_mutex_);
   instance_ = this;
-  struct sigaction sa;
-  sa.sa_handler = signalHandler;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;
-  // Save previous handler and install new one
-  sigaction(SIGINT, &sa, &previous_sigaction_);
+  previous_signal_handler_ = std::signal(SIGINT, signalHandler);
 }
 
 void FanucClient::restoreSignalHandler()
@@ -934,8 +929,7 @@ void FanucClient::restoreSignalHandler()
   if (instance_ == this)
   {
     instance_ = nullptr;
-    // Restore previous signal handler using sigaction (consistent with setup)
-    sigaction(SIGINT, &previous_sigaction_, nullptr);
+    std::signal(SIGINT, previous_signal_handler_);
   }
 }
 

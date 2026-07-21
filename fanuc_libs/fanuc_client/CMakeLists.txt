@@ -48,7 +48,7 @@ if(FANUC_CLIENT_COMMAND_PLOT)
 endif()
 
 add_library(fanuc_client SHARED ${FANUC_CLIENT_SOURCES})
-set_target_properties(fanuc_client PROPERTIES CXX_STANDARD 17)
+set_target_properties(fanuc_client PROPERTIES CXX_STANDARD 20)
 target_link_libraries(fanuc_client PUBLIC stream_motion rmi Eigen3::Eigen)
 target_link_libraries(fanuc_client PRIVATE readerwriterqueue ruckig)
 target_include_directories(fanuc_client PUBLIC
