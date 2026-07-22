@@ -163,13 +163,15 @@ public:
     return force_sensor_type_;
   }
 
-  const RobotStatus& robot_status() const
+  RobotStatus robot_status() const
   {
+    std::lock_guard<std::mutex> lock(state_mutex_);
     return robot_status_;
   }
 
-  const ForceSensor& force_sensor() const
+  ForceSensor force_sensor() const
   {
+    std::lock_guard<std::mutex> lock(state_mutex_);
     return force_sensor_;
   }
 
@@ -210,6 +212,10 @@ private:
 private:
   void readStateFromQueue();
 
+  /** Publish a status packet into shared state used by bindings / readers. */
+  void publishRobotStatus(const stream_motion::RobotStatusPacket& robot_status);
+
+  /** Lockstep Stream Motion RT loop: getStatus → command → sendCommand. */
   void streamMotionThread(const Eigen::VectorXd& joint_angles);
 
   /** Grab the limits from the robot.*/
@@ -260,6 +266,8 @@ private:
   RobotStatus robot_status_;
   ForceSensor force_sensor_;
   bool in_motion_ = false;
+  /** Protects last_joint_angles_ / robot_status_ / force_sensor_ / in_motion_ / gpio status. */
+  mutable std::mutex state_mutex_;
   uint32_t control_period_ = 0;
   uint32_t client_version_ = 0;  // stream motion client version
 

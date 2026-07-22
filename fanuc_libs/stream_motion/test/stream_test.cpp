@@ -22,7 +22,8 @@ class FakeRobot
 {
 public:
   const std::string ip_address = "127.0.0.1";
-  const uint16_t port = 60015;
+  // Avoid clashing with a live Stream Motion session on the default port.
+  const uint16_t port = 60115;
 
   FakeRobot()
   {
@@ -179,8 +180,8 @@ TEST(StreamMotionConnectionTest, TestSuccessfulConnectionCycle)
   // Create mock robot
   auto robot = FakeRobot();
 
-  // Create stream motion connection
-  stream_motion::StreamMotionConnection connection(robot.ip_address, robot.port);
+  // Create stream motion connection (timeout seconds, then port)
+  stream_motion::StreamMotionConnection connection(robot.ip_address, 1.0, robot.port);
 
   // Send start packet and expect a status packet back
   connection.sendStartPacket();
@@ -212,8 +213,8 @@ TEST(StreamMotionConnectionTest, TestGetJointLimits)
   // Create mock robot
   auto robot = FakeRobot();
 
-  // Create stream motion connection
-  const stream_motion::StreamMotionConnection connection(robot.ip_address, robot.port);
+  // Create stream motion connection (timeout seconds, then port)
+  const stream_motion::StreamMotionConnection connection(robot.ip_address, 1.0, robot.port);
 
   stream_motion::RobotThresholdPacket robot_threshold_velocity{};
   stream_motion::RobotThresholdPacket robot_threshold_acceleration{};
@@ -245,8 +246,8 @@ TEST(StreamMotionConnectionTest, TestConfigureGPIO)
   // Create mock robot
   auto robot = FakeRobot();
 
-  // Create stream motion connection
-  const stream_motion::StreamMotionConnection connection(robot.ip_address, robot.port);
+  // Create stream motion connection (timeout seconds, then port)
+  const stream_motion::StreamMotionConnection connection(robot.ip_address, 1.0, robot.port);
 
   std::thread respond([&robot] { robot.respondIOConfigPacket(); });
   stream_motion::GPIOConfiguration gpio_config;

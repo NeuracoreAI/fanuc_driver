@@ -194,6 +194,17 @@ void FanucClient::readStateFromQueue()
     return;
   }
 
+  publishRobotStatus(robot_status);
+}
+
+void FanucClient::publishRobotStatus(const stream_motion::RobotStatusPacket& robot_status)
+{
+  std::lock_guard<std::mutex> lock(state_mutex_);
+
+  if (last_joint_angles_.size() != static_cast<Eigen::Index>(robot_status.joint_angle.size()))
+  {
+    last_joint_angles_ = Eigen::VectorXd::Zero(robot_status.joint_angle.size());
+  }
   for (Eigen::Index i = 0; i < robot_status.joint_angle.size(); ++i)
   {
     last_joint_angles_[i] = static_cast<double>(robot_status.joint_angle[i]);
@@ -226,6 +237,11 @@ void FanucClient::writeJointTarget(const Eigen::VectorXd& joint_targets)
 {
   AssertIsStreaming(is_streaming_);
   readStateFromQueue();
+  Eigen::VectorXd measured;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    measured = last_joint_angles_;
+  }
   if (do_motn_ctrl_)
   {
     // Active control: always stream the (continuous, open-loop) command. Do NOT
@@ -240,10 +256,10 @@ void FanucClient::writeJointTarget(const Eigen::VectorXd& joint_targets)
   {
     // Read-only / motion disabled: track the measured position so the command
     // equals the current pose (no motion now, and no jump when motion is enabled).
-    last_joint_angles_cmd_ = last_joint_angles_;
+    last_joint_angles_cmd_ = measured;
   }
 
-  if (joint_targets.size() != last_joint_angles_.size())
+  if (joint_targets.size() != measured.size())
   {
     throw std::invalid_argument("Joint targets size does not match the size of last joint angles.");
   }
@@ -280,7 +296,6 @@ Eigen::Ref<const Eigen::VectorXd> FanucClient::readJointAngles()
 {
   AssertIsStreaming(is_streaming_);
   readStateFromQueue();
-
   return last_joint_angles_;
 }
 
@@ -340,6 +355,9 @@ void FanucClient::streamMotionThread(const Eigen::VectorXd& joint_angles)
       motion_possible = (status.status & 0x1) != 0;
     }
 
+    publishRobotStatus(status);
+    p_queue_impl_->robot_state_queue_.try_enqueue(status);
+
     Eigen::VectorXd measured = Eigen::VectorXd::Zero(status.joint_angle.size());
     for (Eigen::Index i = 0; i < status.joint_angle.size(); ++i)
     {
@@ -361,7 +379,6 @@ void FanucClient::streamMotionThread(const Eigen::VectorXd& joint_angles)
     // Last host-side command + measured before the UDP socket write.
     recordOutgoingCommandForPlot(measured);
     stream_motion_->sendCommand(command_pos, !is_streaming_, command_io, ((motion_possible && do_motn_ctrl_) ? 1 : 0));
-    p_queue_impl_->robot_state_queue_.enqueue(status);
   }
 }
 
@@ -688,6 +705,7 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
     }
   }
   p_queue_impl_->robot_state_queue_.enqueue(status);
+  publishRobotStatus(status);
   is_streaming_ = true;
   last_joint_angles_ = Eigen::VectorXd::Zero(status.joint_angle.size());
   for (Eigen::Index i = 0; i < status.joint_angle.size(); ++i)

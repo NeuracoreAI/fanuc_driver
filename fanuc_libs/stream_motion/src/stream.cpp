@@ -6,6 +6,7 @@
 #include "stream_motion/stream.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -119,7 +120,7 @@ struct StreamMotionConnection::PSocketImpl
   }
 
   template <typename T>
-  bool receive(T& value)
+  bool receive(T& value, const bool blocking)
   {
     // Clear the status packet before receiving new data
     value = T();
@@ -130,20 +131,27 @@ struct StreamMotionConnection::PSocketImpl
     {
       constexpr size_t kPacketNumBytes = sizeof(T);
       sockpp::result<size_t> res = sock.recv(buf, kPacketNumBytes);
-      if (res != kPacketNumBytes &&
-          std::chrono::steady_clock::now() - start_time > std::chrono::duration<double>(timeout))
+      if (res == kPacketNumBytes)
+      {
+        return true;
+      }
+      if (!blocking)
+      {
+        return false;
+      }
+      if (std::chrono::steady_clock::now() - start_time > std::chrono::duration<double>(timeout))
       {
         std::cerr << "Timeout while reading from UDP socket." << std::endl;
         return false;
       }
-      if (res == kPacketNumBytes)
-      {
-        break;
-      }
       std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
+  }
 
-    return true;
+  template <typename T>
+  bool receive(T& value)
+  {
+    return receive(value, true);
   }
 
   sockpp::udp_socket sock;
@@ -248,6 +256,9 @@ bool StreamMotionConnection::getControllerCapability(ControllerCapabilityResultP
 
 void StreamMotionConnection::sendStartPacket() const
 {
+  // Robot starts a new Stream Motion session at sequence 1; local counters must match.
+  resetStreamSequences();
+
   StartPacket start_packet{};
   start_packet.packet_type = swapBytesIfNeeded(start_packet.packet_type);
   start_packet.version_no = swapBytesIfNeeded(version_no_);
@@ -260,6 +271,8 @@ void StreamMotionConnection::sendStopPacket() const
   stop_packet.packet_type = swapBytesIfNeeded(stop_packet.packet_type);
   stop_packet.version_no = swapBytesIfNeeded(version_no_);
   socket_impl_->send(stop_packet);
+
+  resetStreamSequences();
 }
 
 void StreamMotionConnection::configureForceSensor(uint32_t do_reset, uint32_t force_sensor_type) const
@@ -385,6 +398,15 @@ void StreamMotionConnection::sendCommand(const std::array<double, kMaxAxisNumber
 
 bool StreamMotionConnection::getStatusPacket(RobotStatusPacket& status)
 {
+  // After stop/start or a long MOTN fault, the robot restarts status at seq 1 while
+  // the client may still hold a large command_sequence_no_. Recover instead of wedging.
+  if (command_sequence_no_ > status_sequence_no_)
+  {
+    std::cerr << "Command seq ahead of status seq (cmd=" << command_sequence_no_
+              << " status=" << status_sequence_no_ << "); resetting local sequences.\n";
+    resetStreamSequences();
+  }
+
   if (command_sequence_no_ == status_sequence_no_)
   {
     status = RobotStatusPacket{};
@@ -427,34 +449,26 @@ bool StreamMotionConnection::getStatusPacket(RobotStatusPacket& status)
       return false;
     }
 
-    status_sequence_no_++;
-
     // Swap the bits of the received status packet
     swapRobotStatusPacketBytes(status);
 
-    if (status_sequence_no_ != status.sequence_no)
+    const uint32_t expected = status_sequence_no_ + 1;
+    if (status_sequence_no_ != 0 && status.sequence_no != expected)
     {
-      std::cerr << "Status seq skipped. Expected seq: " << status_sequence_no_
-                << " Received seq: " << status.sequence_no << std::endl;
-      status_sequence_no_ = status.sequence_no;
+      std::cerr << "Status seq resync. Expected: " << expected << " Received: " << status.sequence_no << std::endl;
     }
-  }
-  else if (command_sequence_no_ < status_sequence_no_)
-  {
-    std::cerr << "Command lagging behind. Command seq: " << command_sequence_no_
-              << " Status seq: " << status_sequence_no_ << std::endl;
-    std::cerr << "Sending extra command to catch up." << std::endl;
-  }
-  else
-  {
-    std::cerr << "Command seq exceeded status seq. Command seq: " << command_sequence_no_
-              << " Status seq: " << status_sequence_no_ << std::endl;
-    std::cerr << "This should not happen. Something is wrong. Need to abort." << std::endl;
-    return false;
+
+    // Authoritative sync: next sendCommand must acknowledge this status sequence.
+    status_sequence_no_ = status.sequence_no;
+    command_sequence_no_ = status.sequence_no;
+    return true;
   }
 
+  // command < status: send an extra command to catch up (no receive this cycle).
+  std::cerr << "Command lagging behind. Command seq: " << command_sequence_no_
+            << " Status seq: " << status_sequence_no_ << std::endl;
+  std::cerr << "Sending extra command to catch up." << std::endl;
   command_sequence_no_++;
-
   return true;
 }
 

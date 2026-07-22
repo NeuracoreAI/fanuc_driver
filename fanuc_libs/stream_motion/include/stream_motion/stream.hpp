@@ -35,13 +35,15 @@ public:
    * numerical types, the values are encoded in little endian format.
    * @param is_last_command Indicates if this is the last command in the sequence.
    * @param do_motn_ctrl indicates if this packet controls the robot motion.
+   *
+   * Must be paired with a preceding ``getStatusPacket`` (FANUC Stream Motion is lockstep).
    */
   virtual void sendCommand(const std::array<double, kMaxAxisNumber>& command_pos, bool is_last_command,
                            const std::array<uint8_t, 256>& io_command, const uint8_t do_motn_ctrl) const = 0;
 
   /**
    * @brief Receives a robot status packet from the robot. This method blocks until a status packet is received or a
-   * timeout occurs.
+   * timeout occurs. Advances the command sequence used by the next ``sendCommand``.
    * @param status Reference to a RobotStatusPacket to store the received status.
    * @return true if the status packet was received successfully, false is a timeout occurs.
    */
@@ -103,8 +105,15 @@ public:
   void configureForceSensor(uint32_t do_reset, uint32_t force_sensor_type) const override;
 
 private:
-  uint32_t status_sequence_no_ = 0;
-  uint32_t command_sequence_no_ = 0;
+  void resetStreamSequences() const
+  {
+    status_sequence_no_ = 0;
+    command_sequence_no_ = 0;
+  }
+
+  // Mutable: start/stop are const in the public API but must clear sequence state.
+  mutable uint32_t status_sequence_no_ = 0;
+  mutable uint32_t command_sequence_no_ = 0;
 
   uint32_t version_no_ = kVersion;  // stream motion available version from ControllerCapabilityResultPacket
 

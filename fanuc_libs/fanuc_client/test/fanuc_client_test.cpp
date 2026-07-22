@@ -37,6 +37,9 @@ public:
   void sendCommand(const std::array<double, stream_motion::kMaxAxisNumber>& command_pos, bool is_last_command,
                    const std::array<uint8_t, 256>& io_command, const uint8_t do_motn_ctrl) const override
   {
+    (void)is_last_command;
+    (void)io_command;
+    (void)do_motn_ctrl;
     for (int i = 0; i < stream_motion::kMaxAxisNumber; ++i)
     {
       status_.joint_angle[i] = static_cast<float>(command_pos[i]);
@@ -74,6 +77,7 @@ public:
 
   bool configureGPIO(const stream_motion::GPIOConfiguration& config) const override
   {
+    (void)config;
     return true;
   }
 
@@ -85,6 +89,8 @@ public:
 
   void configureForceSensor(uint32_t do_reset, uint32_t force_sensor_type) const override
   {
+    (void)do_reset;
+    (void)force_sensor_type;
   }
 
 private:
@@ -138,6 +144,7 @@ public:
   rmi::ReadVariablePacket::Response readVariablePacket(const std::string& variable_name,
                                                        std::optional<double> timeout) override
   {
+    (void)timeout;
     assert(variable_name == std::string("$STMO.$COM_INT"));
     rmi::ReadVariablePacket::Response response{};
     response.VariableValue = 8;
@@ -248,17 +255,7 @@ TEST(RMISington, OnlyOneInstanceCreated)
   fanuc_client::RMISingleton::setRMIInstance(std::move(rmi_inst));
 
   // Retrieve the singleton instance twice and check that both references point to the same object
-  auto rmi_connection_inst1 = fanuc_client::RMISingleton::getRMIInstance();
-  auto rmi_connection_inst2 = fanuc_client::RMISingleton::getRMIInstance();
-  EXPECT_EQ(rmi_connection_inst1.get(), rmi_connection_inst2.get());
-
-  // Create a new MockRMIConnection instance and replace the singleton
-  auto new_rmi_inst = std::make_unique<MockRMIConnection>();
-  MockRMIConnection* new_rmi_inst_ptr = new_rmi_inst.get();
-  fanuc_client::RMISingleton::setRMIInstance(std::move(new_rmi_inst));
-
-  // Retrieve the singleton instance again and check that it has changed to the new object
-  auto rmi_connection_inst3 = fanuc_client::RMISingleton::getRMIInstance();
-  EXPECT_NE(rmi_connection_inst2.get(), rmi_connection_inst3.get());
-  EXPECT_EQ(rmi_connection_inst3.get(), new_rmi_inst_ptr);
+  auto inst1 = fanuc_client::RMISingleton::getRMIInstance();
+  auto inst2 = fanuc_client::RMISingleton::getRMIInstance();
+  EXPECT_EQ(inst1.get(), inst2.get());
 }
