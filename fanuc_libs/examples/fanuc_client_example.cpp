@@ -33,12 +33,11 @@ int main()
 
     auto gpio_buffer = std::make_shared<fanuc_client::GPIOBuffer>(gpio_builder.build());
 
-    fanuc_client.startRMI();
+    // STREAM_MOTN must already be running on the teach pendant.
+    fanuc_client.startRealtimeStream(gpio_buffer);
     Eigen::VectorXd initial_command = Eigen::VectorXd::Zero(9);
     initial_command[4] = -90;
-    fanuc_client.writeJointTargetRMI(initial_command);
-
-    fanuc_client.startRealtimeStream(gpio_buffer);
+    fanuc_client.setDoMotnCtrl(true);
     Eigen::VectorXd current_command = initial_command;
     fanuc_client.writeJointTarget(initial_command);
 

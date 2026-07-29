@@ -352,8 +352,10 @@ FanucHardwareInterface::on_configure(const rclcpp_lifecycle::State& /*previous_s
     return CallbackReturn::ERROR;
   }
 
-  RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface), "payload_schedule: " << payload_schedule_);
-  RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface), "Starting RMI with: " << ip_address_);
+  RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface), "payload_schedule: " << payload_schedule_
+                                                                              << " (ignored: RMI removed from FanucClient)");
+  RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface),
+                     "Connecting Stream Motion (STREAM_MOTN must already be running) at: " << ip_address_);
   RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface), "Initial Motion Control Mode: " << initial_motion_control);
 
   // Initialize the driver client
@@ -363,14 +365,9 @@ FanucHardwareInterface::on_configure(const rclcpp_lifecycle::State& /*previous_s
     try
     {
       fanuc_client_.reset();
-      fanuc_client_ = std::make_unique<fanuc_client::FanucClient>(ip_address_, stream_motion_port_, rmi_port_);
+      fanuc_client_ = std::make_unique<fanuc_client::FanucClient>(ip_address_, stream_motion_port_);
       fanuc_client_->setDoMotnCtrl(initial_motion_control);
       fanuc_client_->setForceSensorType(force_sensor_type_);
-      if (initial_motion_control)
-      {
-        fanuc_client_->startRMI();
-      }
-      fanuc_client_->setPayloadSchedule(payload_schedule_);
       fanuc_client_->validateGPIOBuffer(gpio_buffer_);
       RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface), "Successfully connected to the robot.");
       RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface),
