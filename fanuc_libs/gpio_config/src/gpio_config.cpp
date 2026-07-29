@@ -14,7 +14,7 @@ namespace gpio_config
 
 GPIOConfig ParseGPIOConfig(const std::filesystem::path& file_name)
 {
-  std::string file_name_str = std::filesystem::absolute(file_name);
+  std::string file_name_str = std::filesystem::absolute(file_name).string();
   rfl::Result<GPIOConfig> result = rfl::yaml::load<GPIOConfig>(file_name_str);
 
   if (!result.has_value())

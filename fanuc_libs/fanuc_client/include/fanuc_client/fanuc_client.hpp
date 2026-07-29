@@ -5,7 +5,10 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <csignal>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -54,9 +57,9 @@ class FanucClient
 {
 public:
   FanucClient() = delete;
-  explicit FanucClient(std::string robot_ip, uint16_t stream_motion_port = 60015, uint16_t rmi_port = 16001,
-                       std::unique_ptr<stream_motion::StreamMotionInterface> stream_motion_interface = nullptr,
-                       std::unique_ptr<rmi::RMIConnectionInterface> rmi_connection_interface = nullptr);
+  /** Stream Motion only. STREAM_MOTN (IBGN) must already be running on the TP. */
+  explicit FanucClient(std::string robot_ip, uint16_t stream_motion_port = 60015,
+                       std::unique_ptr<stream_motion::StreamMotionInterface> stream_motion_interface = nullptr);
 
   FanucClient(const FanucClient&) = delete;
   FanucClient& operator=(const FanucClient&) = delete;
@@ -65,11 +68,7 @@ public:
 
   void writeJointTarget(const Eigen::VectorXd& joint_targets);
 
-  void writeJointTargetRMI(const Eigen::VectorXd& joint_targets);
-
   Eigen::Ref<const Eigen::VectorXd> readJointAngles();
-
-  Eigen::Ref<const Eigen::VectorXd> readJointAnglesRMI();
 
   bool sendIOCommand() const;
 
@@ -82,10 +81,13 @@ public:
 
   bool isStreaming();
 
-  void startRMI();
-
+  /**
+   * Check that Stream Motion reports motion_possible (STREAM_MOTN / IBGN ready).
+   * Does not start or stop the TP program — operator keeps STREAM_MOTN running.
+   */
   bool startMotionControl();
 
+  /** Disarm motion control locally (do_motn_ctrl=false). Leaves STREAM_MOTN running. */
   void stopMotionControl();
 
   bool getDoMotnCtrl() const
@@ -102,8 +104,6 @@ public:
                  std::vector<double>& jerk_limit) const;
 
   uint32_t getControlPeriod() const;
-
-  void setPayloadSchedule(uint8_t payload_schedule) const;
 
   void validateGPIOBuffer(const std::shared_ptr<GPIOBuffer>& gpio_buffer) const;
 
@@ -168,8 +168,8 @@ private:
   /** Mutex to protect instance_ access from signal handler */
   static std::mutex instance_mutex_;
 
-  /** Previous signal handler to restore */
-  static struct sigaction previous_sigaction_;
+  /** Previous SIGINT handler to restore (portable; avoids POSIX sigaction) */
+  static void (*previous_signal_handler_)(int);
 
 private:
   void readStateFromQueue();
@@ -181,7 +181,6 @@ private:
 
   const std::string robot_ip_;
   const uint16_t stream_motion_port_;
-  const uint16_t rmi_port_;
 
   // Limits
   Eigen::MatrixXd vel_limits_no_load_ = Eigen::MatrixXd::Zero(9, 20);
@@ -211,11 +210,7 @@ private:
   // Real time thread data
   std::thread rt_thread_;
 
-  bool do_motn_ctrl_ = true;
-
-  // Manages RMI connection
-  std::shared_ptr<rmi::RMIConnectionInterface> rmi_connection_;
-  std::atomic<bool> rmi_running_ = false;
+  bool do_motn_ctrl_ = false;
 
   // Output command interpolation buffer target size for stream motion control
   uint32_t out_cmd_interp_buff_target_;
@@ -227,6 +222,7 @@ private:
   std::unique_ptr<PQueueImpl> p_queue_impl_;
 };
 
+/** Retained for ROS GPIO / hardware_interface callers; FanucClient no longer uses RMI. */
 class RMISingleton
 {
 public:

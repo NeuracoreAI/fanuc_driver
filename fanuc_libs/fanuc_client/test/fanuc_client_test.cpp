@@ -168,15 +168,12 @@ public:
 };
 
 using NiceMockStreamMotionConnection = testing::NiceMock<MockStreamMotionConnection>;
-using NiceMockRMIConnection = testing::NiceMock<MockRMIConnection>;
 
 TEST(FanucClientTest, TestSuccessfulLifecycle)
 {
   std::atomic<bool> stream_connected = false;
   auto stream_motion_interface = std::make_unique<NiceMockStreamMotionConnection>(stream_connected);
-  auto rmi_interface = std::make_unique<NiceMockRMIConnection>();
-  fanuc_client::FanucClient fanuc_client("127.0.0.1", 60015, 16001, std::move(stream_motion_interface),
-                                         std::move(rmi_interface));
+  fanuc_client::FanucClient fanuc_client("127.0.0.1", 60015, std::move(stream_motion_interface));
 
   // Reading/Writing data before starting the stream should throw an error
   const Eigen::VectorXd initial_joint_targets = Eigen::VectorXd::Zero(stream_motion::kMaxAxisNumber);
@@ -196,6 +193,7 @@ TEST(FanucClientTest, TestSuccessfulLifecycle)
   EXPECT_EQ(joint_states, initial_joint_targets);
 
   // Writing joint targets should update the joint states eventually
+  fanuc_client.setDoMotnCtrl(true);
   Eigen::VectorXd joint_targets = joint_states.array() + 1.0;
   while (joint_states == initial_joint_targets)
   {
@@ -218,9 +216,7 @@ TEST(FanucClientTest, TestGetLimits)
 {
   std::atomic<bool> stream_connected = false;
   auto stream_motion_interface = std::make_unique<MockStreamMotionConnection>(stream_connected);
-  auto rmi_interface = std::make_unique<NiceMockRMIConnection>();
-  fanuc_client::FanucClient fanuc_client("127.0.0.1", 60015, 16001, std::move(stream_motion_interface),
-                                         std::move(rmi_interface));
+  fanuc_client::FanucClient fanuc_client("127.0.0.1", 60015, std::move(stream_motion_interface));
   const double v_peak = 1000.0;
   const double payload = 0.0;
   std::vector<double> vel_limit;
