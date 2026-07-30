@@ -11,7 +11,12 @@ option(BUILD_EXAMPLES "Build examples" OFF)
 # Find dependencies
 find_package(Eigen3 REQUIRED)
 
-add_library(fanuc_client SHARED src/fanuc_client.cpp src/gpio_buffer.cpp src/rmi_singleton.cpp)
+add_library(fanuc_client SHARED
+    src/fanuc_client.cpp
+    src/gpio_buffer.cpp
+    src/rmi_singleton.cpp
+    src/joint_slew_interpolator.cpp
+)
 set_target_properties(fanuc_client PROPERTIES CXX_STANDARD 20)
 target_link_libraries(fanuc_client PUBLIC stream_motion rmi Eigen3::Eigen)
 target_link_libraries(fanuc_client PRIVATE readerwriterqueue)

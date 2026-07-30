@@ -6,6 +6,7 @@
 #include "fanuc_client/fanuc_client.hpp"
 
 #include <Eigen/Core>
+#include <algorithm>
 #include <csignal>
 #include <cstdint>
 #include <iostream>
@@ -182,7 +183,7 @@ void FanucClient::writeJointTarget(const Eigen::VectorXd& joint_targets)
 {
   AssertIsStreaming(is_streaming_);
   readStateFromQueue();
-  if (robot_status_.motion_possible && do_motn_ctrl_)
+  if (robot_status_.motion_possible && do_motn_ctrl_.load(std::memory_order_relaxed))
   {
     last_joint_angles_cmd_ = joint_targets;
   }
@@ -197,6 +198,133 @@ void FanucClient::writeJointTarget(const Eigen::VectorXd& joint_targets)
   }
   auto cur_time_from_start = std::chrono::high_resolution_clock::now() - start_time_;
   p_queue_impl_->command_queue_.enqueue({ cur_time_from_start, last_joint_angles_cmd_ });
+}
+
+void FanucClient::setJointGoal(const Eigen::VectorXd& joint_goal_deg)
+{
+  Eigen::VectorXd goal = Eigen::VectorXd::Zero(stream_motion::kMaxAxisNumber);
+  const Eigen::Index n = std::min<Eigen::Index>(joint_goal_deg.size(), stream_motion::kMaxAxisNumber);
+  goal.head(n) = joint_goal_deg.head(n);
+  goal = clampToPositionLimits(goal);
+  std::lock_guard<std::mutex> lock(slew_mutex_);
+  joint_goal_ = goal;
+  stream_slew_.setTarget(goal);
+}
+
+Eigen::VectorXd FanucClient::getJointGoal() const
+{
+  std::lock_guard<std::mutex> lock(slew_mutex_);
+  return joint_goal_;
+}
+
+void FanucClient::setStreamMaxVel(const double max_vel_deg_s)
+{
+  stream_max_vel_deg_s_.store(std::max(0.1, max_vel_deg_s), std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(slew_mutex_);
+  applySlewLimitsLocked();
+}
+
+double FanucClient::getStreamMaxVel() const
+{
+  return stream_max_vel_deg_s_.load(std::memory_order_relaxed);
+}
+
+void FanucClient::setStreamMaxAcc(const double max_acc_deg_s2)
+{
+  stream_max_acc_deg_s2_.store(max_acc_deg_s2, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(slew_mutex_);
+  applySlewLimitsLocked();
+}
+
+double FanucClient::getStreamMaxAcc() const
+{
+  return stream_max_acc_deg_s2_.load(std::memory_order_relaxed);
+}
+
+void FanucClient::setJointPositionLimits(const std::vector<double>& lower_deg, const std::vector<double>& upper_deg)
+{
+  std::lock_guard<std::mutex> lock(slew_mutex_);
+  joint_pos_lower_deg_ = lower_deg;
+  joint_pos_upper_deg_ = upper_deg;
+}
+
+void FanucClient::resetStreamCommandToMeasured()
+{
+  AssertIsStreaming(is_streaming_);
+  readStateFromQueue();
+  resetStreamCommand(last_joint_angles_);
+}
+
+void FanucClient::resetStreamCommand(const Eigen::VectorXd& joints_deg)
+{
+  Eigen::VectorXd pose = Eigen::VectorXd::Zero(stream_motion::kMaxAxisNumber);
+  const Eigen::Index n = std::min<Eigen::Index>(joints_deg.size(), stream_motion::kMaxAxisNumber);
+  pose.head(n) = joints_deg.head(n);
+  pose = clampToPositionLimits(pose);
+  std::lock_guard<std::mutex> lock(slew_mutex_);
+  joint_goal_ = pose;
+  stream_slew_.reset(pose);
+}
+
+void FanucClient::setDoMotnCtrl(const bool do_motn_ctrl)
+{
+  do_motn_ctrl_.store(do_motn_ctrl, std::memory_order_relaxed);
+}
+
+void FanucClient::applySlewLimitsLocked()
+{
+  stream_slew_.setLimits(stream_max_vel_deg_s_.load(std::memory_order_relaxed),
+                         stream_max_acc_deg_s2_.load(std::memory_order_relaxed));
+}
+
+Eigen::VectorXd FanucClient::clampToPositionLimits(const Eigen::VectorXd& joints) const
+{
+  if (joint_pos_lower_deg_.empty() || joint_pos_upper_deg_.empty())
+  {
+    return joints;
+  }
+  Eigen::VectorXd out = joints;
+  const Eigen::Index n =
+      std::min<Eigen::Index>({ out.size(), static_cast<Eigen::Index>(joint_pos_lower_deg_.size()),
+                               static_cast<Eigen::Index>(joint_pos_upper_deg_.size()) });
+  for (Eigen::Index i = 0; i < n; ++i)
+  {
+    out[i] = std::clamp(out[i], joint_pos_lower_deg_[static_cast<size_t>(i)],
+                        joint_pos_upper_deg_[static_cast<size_t>(i)]);
+  }
+  return out;
+}
+
+void FanucClient::jointSlewThread()
+{
+  const double period_s = static_cast<double>(control_period_) / 1000.0;
+  const double dt = period_s / kSlewRateMultiplier;
+  const auto tick = std::chrono::duration<double>(dt);
+
+  while (slew_running_.load(std::memory_order_relaxed))
+  {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (is_streaming_.load(std::memory_order_relaxed) && do_motn_ctrl_.load(std::memory_order_relaxed))
+    {
+      Eigen::VectorXd cmd;
+      {
+        std::lock_guard<std::mutex> lock(slew_mutex_);
+        applySlewLimitsLocked();
+        stream_slew_.setTarget(joint_goal_);
+        cmd = stream_slew_.step(dt);
+        cmd = clampToPositionLimits(cmd);
+      }
+      try
+      {
+        writeJointTarget(cmd);
+      }
+      catch (const std::exception&)
+      {
+        // Stream may be tearing down; exit quietly on the next flag check.
+      }
+    }
+    std::this_thread::sleep_until(t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(tick));
+  }
 }
 
 Eigen::Ref<const Eigen::VectorXd> FanucClient::readJointAngles()
@@ -311,7 +439,8 @@ void FanucClient::streamMotionThread(const Eigen::VectorXd& joint_angles)
     // Handle IO commands.
     while (p_queue_impl_->command_io_queue_.try_dequeue(command_io)) {}
 
-    stream_motion_->sendCommand(command_pos, !is_streaming_, command_io, ((motion_possible && do_motn_ctrl_) ? 1 : 0));
+    stream_motion_->sendCommand(command_pos, !is_streaming_, command_io,
+                                ((motion_possible && do_motn_ctrl_.load(std::memory_order_relaxed)) ? 1 : 0));
     p_queue_impl_->robot_state_queue_.enqueue(status);
   }
 }
@@ -417,7 +546,7 @@ void FanucClient::stopMotionControl()
 {
   AssertIsStreaming(is_streaming_);
 
-  do_motn_ctrl_ = false;
+  do_motn_ctrl_.store(false, std::memory_order_relaxed);
 
   // Wait for robot to stop motion (STREAM_MOTN stays running on the TP).
   const auto motion_pre_loop_time = std::chrono::steady_clock::now();
@@ -476,18 +605,37 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
     last_joint_angles_[i] = static_cast<double>(status.joint_angle[i]);
     command_pos[i] = static_cast<double>(status.joint_angle[i]);
   }
-  stream_motion_->sendCommand(command_pos, false, {}, (do_motn_ctrl_ ? 1 : 0));
+  stream_motion_->sendCommand(command_pos, false, {}, (do_motn_ctrl_.load(std::memory_order_relaxed) ? 1 : 0));
+
+  {
+    std::lock_guard<std::mutex> lock(slew_mutex_);
+    joint_goal_ = last_joint_angles_;
+    applySlewLimitsLocked();
+    stream_slew_.reset(last_joint_angles_);
+  }
 
   if (rt_thread_.joinable())
   {
     rt_thread_.join();
   }
   rt_thread_ = std::thread([this] { streamMotionThread(last_joint_angles_); });
+
+  slew_running_.store(true, std::memory_order_relaxed);
+  if (slew_thread_.joinable())
+  {
+    slew_thread_.join();
+  }
+  slew_thread_ = std::thread([this] { jointSlewThread(); });
 }
 
 void FanucClient::stopRealtimeStream()
 {
-  do_motn_ctrl_ = false;
+  do_motn_ctrl_.store(false, std::memory_order_relaxed);
+  slew_running_.store(false, std::memory_order_relaxed);
+  if (slew_thread_.joinable())
+  {
+    slew_thread_.join();
+  }
   is_streaming_ = false;
   if (rt_thread_.joinable())
   {

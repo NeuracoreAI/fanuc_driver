@@ -17,6 +17,7 @@
 #include <Eigen/Core>
 
 #include "fanuc_client/gpio_buffer.hpp"
+#include "fanuc_client/joint_slew_interpolator.hpp"
 #include "rmi/rmi.hpp"
 #include "stream_motion/stream.hpp"
 
@@ -68,6 +69,30 @@ public:
 
   void writeJointTarget(const Eigen::VectorXd& joint_targets);
 
+  /**
+   * Set the sticky joint goal (degrees) chased by the slew feeder thread.
+   * Does not enqueue a raw jump — the slewer publishes shaped commands via
+   * writeJointTarget into the existing Stream Motion queue.
+   */
+  void setJointGoal(const Eigen::VectorXd& joint_goal_deg);
+
+  Eigen::VectorXd getJointGoal() const;
+
+  void setStreamMaxVel(double max_vel_deg_s);
+  double getStreamMaxVel() const;
+
+  void setStreamMaxAcc(double max_acc_deg_s2);
+  double getStreamMaxAcc() const;
+
+  /** Soft position envelope (degrees) applied to slewed commands. Empty disables. */
+  void setJointPositionLimits(const std::vector<double>& lower_deg, const std::vector<double>& upper_deg);
+
+  /** Re-seed sticky goal + slewer from the latest measured joints. */
+  void resetStreamCommandToMeasured();
+
+  /** Re-seed sticky goal + slewer from an explicit pose (e.g. hold on disarm). */
+  void resetStreamCommand(const Eigen::VectorXd& joints_deg);
+
   Eigen::Ref<const Eigen::VectorXd> readJointAngles();
 
   bool sendIOCommand() const;
@@ -92,13 +117,10 @@ public:
 
   bool getDoMotnCtrl() const
   {
-    return do_motn_ctrl_;
+    return do_motn_ctrl_.load(std::memory_order_relaxed);
   }
 
-  void setDoMotnCtrl(const bool do_motn_ctrl)
-  {
-    do_motn_ctrl_ = do_motn_ctrl;
-  }
+  void setDoMotnCtrl(bool do_motn_ctrl);
 
   bool getLimits(double v_peak, double payload, std::vector<double>& vel_limit, std::vector<double>& acc_limit,
                  std::vector<double>& jerk_limit) const;
@@ -176,6 +198,13 @@ private:
 
   void streamMotionThread(const Eigen::VectorXd& joint_angles);
 
+  /** Accel-limited feeder that calls writeJointTarget into the existing queue. */
+  void jointSlewThread();
+
+  void applySlewLimitsLocked();
+
+  Eigen::VectorXd clampToPositionLimits(const Eigen::VectorXd& joints) const;
+
   /** Grab the limits from the robot.*/
   void fetchRobotLimits();
 
@@ -209,8 +238,23 @@ private:
 
   // Real time thread data
   std::thread rt_thread_;
+  std::thread slew_thread_;
+  std::atomic<bool> slew_running_{ false };
 
-  bool do_motn_ctrl_ = false;
+  std::atomic<bool> do_motn_ctrl_{ false };
+
+  // Python-tuned slew limits (defaults match example_fanuc configs).
+  static constexpr double kDefaultStreamMaxVelDegS = 60.0;
+  static constexpr double kDefaultStreamMaxAccDegS2 = 300.0;
+  static constexpr double kSlewRateMultiplier = 4.0;
+  std::atomic<double> stream_max_vel_deg_s_{ kDefaultStreamMaxVelDegS };
+  std::atomic<double> stream_max_acc_deg_s2_{ kDefaultStreamMaxAccDegS2 };
+
+  mutable std::mutex slew_mutex_;
+  JointSlewInterpolator stream_slew_{ stream_motion::kMaxAxisNumber };
+  Eigen::VectorXd joint_goal_ = Eigen::VectorXd::Zero(stream_motion::kMaxAxisNumber);
+  std::vector<double> joint_pos_lower_deg_;
+  std::vector<double> joint_pos_upper_deg_;
 
   // Output command interpolation buffer target size for stream motion control
   uint32_t out_cmd_interp_buff_target_;
