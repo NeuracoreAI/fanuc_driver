@@ -94,9 +94,20 @@ FanucClient::FanucClient(std::string robot_ip, const uint16_t stream_motion_port
 {
   stream_motion_->sendStopPacket();
   stream_motion::ControllerCapabilityResultPacket controller_capability;
-  stream_motion_->getControllerCapability(controller_capability);
-  control_period_ = controller_capability.sampling_rate;
-  client_version_ = controller_capability.available_version;
+  if (!stream_motion_->getControllerCapability(controller_capability) ||
+      controller_capability.sampling_rate < 1 || controller_capability.sampling_rate > 100)
+  {
+    std::cerr << "Controller capability unavailable or invalid sampling_rate="
+              << controller_capability.sampling_rate << "; defaulting control period to "
+              << kDefaultControlPeriodMs << " ms." << std::endl;
+    control_period_ = kDefaultControlPeriodMs;
+    client_version_ = controller_capability.available_version;
+  }
+  else
+  {
+    control_period_ = controller_capability.sampling_rate;
+    client_version_ = controller_capability.available_version;
+  }
   fetchRobotLimits();
 
   setupSignalHandler();
@@ -268,6 +279,27 @@ void FanucClient::resetStreamCommand(const Eigen::VectorXd& joints_deg)
 
 void FanucClient::setDoMotnCtrl(const bool do_motn_ctrl)
 {
+  const bool prev = do_motn_ctrl_.load(std::memory_order_relaxed);
+  if (prev == do_motn_ctrl)
+  {
+    return;
+  }
+
+  // On arm/disarm edges, snap slewer + goal to measured so command_pos cannot
+  // diverge across the do_motn_ctrl transition (avoids MOTN-017 without Python priming).
+  if (is_streaming_.load(std::memory_order_relaxed))
+  {
+    try
+    {
+      readStateFromQueue();
+      resetStreamCommand(last_joint_angles_);
+    }
+    catch (const std::exception&)
+    {
+      // Stream may be tearing down; still apply the flag below.
+    }
+  }
+
   do_motn_ctrl_.store(do_motn_ctrl, std::memory_order_relaxed);
 }
 
@@ -297,26 +329,37 @@ Eigen::VectorXd FanucClient::clampToPositionLimits(const Eigen::VectorXd& joints
 
 void FanucClient::jointSlewThread()
 {
-  const double period_s = static_cast<double>(control_period_) / 1000.0;
+  // Never allow a zero period — that busy-spins writeJointTarget and starves UDP RX.
+  const uint32_t period_ms = std::max(control_period_, kDefaultControlPeriodMs);
+  const double period_s = static_cast<double>(period_ms) / 1000.0;
   const double dt = period_s / kSlewRateMultiplier;
   const auto tick = std::chrono::duration<double>(dt);
 
   while (slew_running_.load(std::memory_order_relaxed))
   {
     const auto t0 = std::chrono::steady_clock::now();
-    if (is_streaming_.load(std::memory_order_relaxed) && do_motn_ctrl_.load(std::memory_order_relaxed))
+    if (is_streaming_.load(std::memory_order_relaxed))
     {
-      Eigen::VectorXd cmd;
-      {
-        std::lock_guard<std::mutex> lock(slew_mutex_);
-        applySlewLimitsLocked();
-        stream_slew_.setTarget(joint_goal_);
-        cmd = stream_slew_.step(dt);
-        cmd = clampToPositionLimits(cmd);
-      }
       try
       {
-        writeJointTarget(cmd);
+        if (do_motn_ctrl_.load(std::memory_order_relaxed))
+        {
+          Eigen::VectorXd cmd;
+          {
+            std::lock_guard<std::mutex> lock(slew_mutex_);
+            applySlewLimitsLocked();
+            stream_slew_.setTarget(joint_goal_);
+            cmd = stream_slew_.step(dt);
+            cmd = clampToPositionLimits(cmd);
+          }
+          writeJointTarget(cmd);
+        }
+        else
+        {
+          // Keep command_pos glued to measured while disarmed (do_motn_ctrl=0).
+          // writeJointTarget already substitutes last_joint_angles_ when disarmed.
+          writeJointTarget(last_joint_angles_);
+        }
       }
       catch (const std::exception&)
       {
@@ -519,6 +562,7 @@ bool FanucClient::startMotionControl()
     readStateFromQueue();
     if (robot_status_.motion_possible)
     {
+      setDoMotnCtrl(true);
       return true;
     }
 
@@ -529,6 +573,7 @@ bool FanucClient::startMotionControl()
       readStateFromQueue();
       if (robot_status_.motion_possible)
       {
+        setDoMotnCtrl(true);
         return true;
       }
     }
@@ -546,7 +591,7 @@ void FanucClient::stopMotionControl()
 {
   AssertIsStreaming(is_streaming_);
 
-  do_motn_ctrl_.store(false, std::memory_order_relaxed);
+  setDoMotnCtrl(false);
 
   // Wait for robot to stop motion (STREAM_MOTN stays running on the TP).
   const auto motion_pre_loop_time = std::chrono::steady_clock::now();
@@ -630,7 +675,7 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
 
 void FanucClient::stopRealtimeStream()
 {
-  do_motn_ctrl_.store(false, std::memory_order_relaxed);
+  setDoMotnCtrl(false);
   slew_running_.store(false, std::memory_order_relaxed);
   if (slew_thread_.joinable())
   {

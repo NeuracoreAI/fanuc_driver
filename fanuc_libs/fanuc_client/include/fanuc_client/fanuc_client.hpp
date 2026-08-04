@@ -107,7 +107,8 @@ public:
   bool isStreaming();
 
   /**
-   * Check that Stream Motion reports motion_possible (STREAM_MOTN / IBGN ready).
+   * Arm local motion control once Stream Motion reports motion_possible
+   * (STREAM_MOTN / IBGN ready). Sets do_motn_ctrl=true on success.
    * Does not start or stop the TP program — operator keeps STREAM_MOTN running.
    */
   bool startMotionControl();
@@ -120,6 +121,12 @@ public:
     return do_motn_ctrl_.load(std::memory_order_relaxed);
   }
 
+  /**
+   * Arm/disarm Stream Motion joint following.
+   * On rising and falling edges, reseeds the slewer from the latest measured
+   * joints so command_pos cannot diverge across the transition.
+   * While disarmed, jointSlewThread keeps enqueueing measured holds.
+   */
   void setDoMotnCtrl(bool do_motn_ctrl);
 
   bool getLimits(double v_peak, double payload, std::vector<double>& vel_limit, std::vector<double>& acc_limit,
@@ -247,6 +254,8 @@ private:
   static constexpr double kDefaultStreamMaxVelDegS = 60.0;
   static constexpr double kDefaultStreamMaxAccDegS2 = 300.0;
   static constexpr double kSlewRateMultiplier = 4.0;
+  /** Fallback when getControllerCapability fails (typical CRX Stream Motion period). */
+  static constexpr uint32_t kDefaultControlPeriodMs = 8;
   std::atomic<double> stream_max_vel_deg_s_{ kDefaultStreamMaxVelDegS };
   std::atomic<double> stream_max_acc_deg_s2_{ kDefaultStreamMaxAccDegS2 };
 
