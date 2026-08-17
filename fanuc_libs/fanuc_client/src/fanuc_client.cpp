@@ -6,6 +6,8 @@
 #include "fanuc_client/fanuc_client.hpp"
 
 #include <Eigen/Core>
+#include <algorithm>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <iostream>
@@ -21,15 +23,15 @@ namespace fanuc_client
 // Static member initialization
 FanucClient* FanucClient::instance_ = nullptr;
 std::mutex FanucClient::instance_mutex_;
-struct sigaction FanucClient::previous_sigaction_;
+void (*FanucClient::previous_signal_handler_)(int) = nullptr;
 
 namespace
 {
 constexpr double kFullPayload = 7.0;
 constexpr auto kStatusPacketFailureMessage = "Invalid robot status packet. Make sure the robot connected can be "
                                              "reached on the network and is in a running state.";
-constexpr auto kStatusStatusNotReadyMessage = "Stream motion control is not ready. Check if the robot has alarms "
-                                              "or something is disturbing Remote Motion's TP program execution.";
+constexpr auto kStatusStatusNotReadyMessage = "Stream motion control is not ready. Check if STREAM_MOTN is running "
+                                              "on the teach pendant and the robot has no alarms.";
 
 void AssertIsStreaming(const std::atomic<bool>& is_streaming)
 {
@@ -45,7 +47,7 @@ void AssertNotStreaming(const std::atomic<bool>& is_streaming)
   if (is_streaming)
   {
     throw std::runtime_error(
-        "Robot is currently streaming. RMI motion commands cannot be issued when stream motion is active.");
+        "Robot is currently streaming. Non-stream commands cannot be issued when stream motion is active.");
   }
 }
 
@@ -79,29 +81,34 @@ struct FanucClient::PQueueImpl
   moodycamel::BlockingReaderWriterQueue<stream_motion::RobotStatusPacket> robot_state_queue_;
 };
 
-FanucClient::FanucClient(std::string robot_ip, const uint16_t stream_motion_port, const uint16_t rmi_port,
-                         std::unique_ptr<stream_motion::StreamMotionInterface> stream_motion_interface,
-                         std::unique_ptr<rmi::RMIConnectionInterface> rmi_connection_interface)
+FanucClient::FanucClient(std::string robot_ip, const uint16_t stream_motion_port,
+                         std::unique_ptr<stream_motion::StreamMotionInterface> stream_motion_interface)
   : robot_ip_{ std::move(robot_ip) }
   , stream_motion_port_{ stream_motion_port }
-  , rmi_port_{ rmi_port }
   , stream_motion_{ stream_motion_interface == nullptr ?
                         std::make_unique<stream_motion::StreamMotionConnection>(robot_ip_, 1.0, stream_motion_port_) :
                         std::move(stream_motion_interface) }
   , command_pos{}
-  , rmi_connection_{ rmi_connection_interface == nullptr ?
-                         RMISingleton::creatNewRMIInstance(robot_ip_, rmi_port_) :
-                         RMISingleton::setRMIInstance(std::move(rmi_connection_interface)) }
   , out_cmd_interp_buff_target_{ 8 }
   , force_sensor_type_{ 0 }
   , p_queue_impl_(std::make_unique<PQueueImpl>())
 {
-  rmi_connection_->connect(5);
   stream_motion_->sendStopPacket();
   stream_motion::ControllerCapabilityResultPacket controller_capability;
-  stream_motion_->getControllerCapability(controller_capability);
-  control_period_ = controller_capability.sampling_rate;
-  client_version_ = controller_capability.available_version;
+  if (!stream_motion_->getControllerCapability(controller_capability) ||
+      controller_capability.sampling_rate < 1 || controller_capability.sampling_rate > 100)
+  {
+    std::cerr << "Controller capability unavailable or invalid sampling_rate="
+              << controller_capability.sampling_rate << "; defaulting control period to "
+              << kDefaultControlPeriodMs << " ms." << std::endl;
+    control_period_ = kDefaultControlPeriodMs;
+    client_version_ = controller_capability.available_version;
+  }
+  else
+  {
+    control_period_ = controller_capability.sampling_rate;
+    client_version_ = controller_capability.available_version;
+  }
   fetchRobotLimits();
 
   setupSignalHandler();
@@ -127,21 +134,6 @@ FanucClient::~FanucClient()
   {
     try
     {
-      std::cout << "Aborting RMI connection during destruction" << std::endl;
-      rmi_connection_->abort(std::nullopt);
-    }
-    catch (const std::exception& e)
-    {
-      std::cerr << "Warning: Failed to abort RMI connection during destruction (connection may be lost): " << e.what()
-                << std::endl;
-    }
-    catch (...)
-    {
-      std::cerr << "Warning: Unknown exception during RMI abort (connection may be lost)" << std::endl;
-    }
-
-    try
-    {
       std::cout << "Sending stop packet during destruction" << std::endl;
       stream_motion_->sendStopPacket();
     }
@@ -153,20 +145,6 @@ FanucClient::~FanucClient()
     {
       std::cerr << "Warning: Unknown exception during stop packet send" << std::endl;
     }
-  }
-
-  try
-  {
-    rmi_connection_->disconnect(std::nullopt);
-  }
-  catch (const std::exception& e)
-  {
-    std::cerr << "Warning: Failed to disconnect RMI during destruction (connection may be lost): " << e.what()
-              << std::endl;
-  }
-  catch (...)
-  {
-    std::cerr << "Warning: Unknown exception during RMI disconnect" << std::endl;
   }
 
   restoreSignalHandler();
@@ -217,7 +195,7 @@ void FanucClient::writeJointTarget(const Eigen::VectorXd& joint_targets)
 {
   AssertIsStreaming(is_streaming_);
   readStateFromQueue();
-  if (robot_status_.motion_possible && do_motn_ctrl_)
+  if (robot_status_.motion_possible && do_motn_ctrl_.load(std::memory_order_relaxed))
   {
     last_joint_angles_cmd_ = joint_targets;
   }
@@ -234,52 +212,183 @@ void FanucClient::writeJointTarget(const Eigen::VectorXd& joint_targets)
   p_queue_impl_->command_queue_.enqueue({ cur_time_from_start, last_joint_angles_cmd_ });
 }
 
-void FanucClient::writeJointTargetRMI(const Eigen::VectorXd& joint_targets)
+void FanucClient::setJointGoal(const Eigen::VectorXd& joint_goal_deg)
 {
-  AssertNotStreaming(is_streaming_);
-  last_joint_angles_cmd_ = joint_targets;
-  last_joint_angles_cmd_[2] = last_joint_angles_cmd_[2] - last_joint_angles_cmd_[1];
+  Eigen::VectorXd goal = Eigen::VectorXd::Zero(stream_motion::kMaxAxisNumber);
+  const Eigen::Index n = std::min<Eigen::Index>(joint_goal_deg.size(), stream_motion::kMaxAxisNumber);
+  goal.head(n) = joint_goal_deg.head(n);
+  goal = clampToPositionLimits(goal);
+  std::lock_guard<std::mutex> lock(slew_mutex_);
+  joint_goal_ = goal;
+  stream_slew_.setTarget(goal);
+}
 
-  rmi::JointMotionJRepPacket::Request request_joint_motion;
-  request_joint_motion.JointAngle.J1 = static_cast<float>(last_joint_angles_cmd_[0]);
-  request_joint_motion.JointAngle.J2 = static_cast<float>(last_joint_angles_cmd_[1]);
-  request_joint_motion.JointAngle.J3 = static_cast<float>(last_joint_angles_cmd_[2]);
-  request_joint_motion.JointAngle.J4 = static_cast<float>(last_joint_angles_cmd_[3]);
-  request_joint_motion.JointAngle.J5 = static_cast<float>(last_joint_angles_cmd_[4]);
-  request_joint_motion.JointAngle.J6 = static_cast<float>(last_joint_angles_cmd_[5]);
-  request_joint_motion.JointAngle.J7 = static_cast<float>(last_joint_angles_cmd_[6]);
-  request_joint_motion.JointAngle.J8 = static_cast<float>(last_joint_angles_cmd_[7]);
-  request_joint_motion.JointAngle.J9 = static_cast<float>(last_joint_angles_cmd_[8]);
-  request_joint_motion.SpeedType = "Percent";
-  request_joint_motion.Speed = 100;
-  request_joint_motion.TermType = "FINE";
-  rmi_connection_->sendJointMotion(request_joint_motion, 5.0);
+Eigen::VectorXd FanucClient::getJointGoal() const
+{
+  std::lock_guard<std::mutex> lock(slew_mutex_);
+  return joint_goal_;
+}
+
+void FanucClient::setStreamMaxVel(const double max_vel_deg_s)
+{
+  stream_max_vel_deg_s_.store(std::max(0.1, max_vel_deg_s), std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(slew_mutex_);
+  applySlewLimitsLocked();
+}
+
+double FanucClient::getStreamMaxVel() const
+{
+  return stream_max_vel_deg_s_.load(std::memory_order_relaxed);
+}
+
+void FanucClient::setStreamMaxAcc(const double max_acc_deg_s2)
+{
+  stream_max_acc_deg_s2_.store(max_acc_deg_s2, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(slew_mutex_);
+  applySlewLimitsLocked();
+}
+
+double FanucClient::getStreamMaxAcc() const
+{
+  return stream_max_acc_deg_s2_.load(std::memory_order_relaxed);
+}
+
+void FanucClient::setSlewRateMultiplier(const double multiplier)
+{
+  slew_rate_multiplier_.store(std::clamp(multiplier, kMinSlewRateMultiplier, kMaxSlewRateMultiplier),
+                              std::memory_order_relaxed);
+}
+
+double FanucClient::getSlewRateMultiplier() const
+{
+  return slew_rate_multiplier_.load(std::memory_order_relaxed);
+}
+
+void FanucClient::setJointPositionLimits(const std::vector<double>& lower_deg, const std::vector<double>& upper_deg)
+{
+  std::lock_guard<std::mutex> lock(slew_mutex_);
+  joint_pos_lower_deg_ = lower_deg;
+  joint_pos_upper_deg_ = upper_deg;
+}
+
+void FanucClient::resetStreamCommandToMeasured()
+{
+  AssertIsStreaming(is_streaming_);
+  readStateFromQueue();
+  resetStreamCommand(last_joint_angles_);
+}
+
+void FanucClient::resetStreamCommand(const Eigen::VectorXd& joints_deg)
+{
+  Eigen::VectorXd pose = Eigen::VectorXd::Zero(stream_motion::kMaxAxisNumber);
+  const Eigen::Index n = std::min<Eigen::Index>(joints_deg.size(), stream_motion::kMaxAxisNumber);
+  pose.head(n) = joints_deg.head(n);
+  pose = clampToPositionLimits(pose);
+  std::lock_guard<std::mutex> lock(slew_mutex_);
+  joint_goal_ = pose;
+  stream_slew_.reset(pose);
+}
+
+void FanucClient::setDoMotnCtrl(const bool do_motn_ctrl)
+{
+  const bool prev = do_motn_ctrl_.load(std::memory_order_relaxed);
+  if (prev == do_motn_ctrl)
+  {
+    return;
+  }
+
+  // On arm/disarm edges, snap slewer + goal to measured so command_pos cannot
+  // diverge across the do_motn_ctrl transition (avoids MOTN-017 without Python priming).
+  if (is_streaming_.load(std::memory_order_relaxed))
+  {
+    try
+    {
+      readStateFromQueue();
+      resetStreamCommand(last_joint_angles_);
+    }
+    catch (const std::exception&)
+    {
+      // Stream may be tearing down; still apply the flag below.
+    }
+  }
+
+  do_motn_ctrl_.store(do_motn_ctrl, std::memory_order_relaxed);
+}
+
+void FanucClient::applySlewLimitsLocked()
+{
+  stream_slew_.setLimits(stream_max_vel_deg_s_.load(std::memory_order_relaxed),
+                         stream_max_acc_deg_s2_.load(std::memory_order_relaxed));
+}
+
+Eigen::VectorXd FanucClient::clampToPositionLimits(const Eigen::VectorXd& joints) const
+{
+  if (joint_pos_lower_deg_.empty() || joint_pos_upper_deg_.empty())
+  {
+    return joints;
+  }
+  Eigen::VectorXd out = joints;
+  const Eigen::Index n =
+      std::min<Eigen::Index>({ out.size(), static_cast<Eigen::Index>(joint_pos_lower_deg_.size()),
+                               static_cast<Eigen::Index>(joint_pos_upper_deg_.size()) });
+  for (Eigen::Index i = 0; i < n; ++i)
+  {
+    out[i] = std::clamp(out[i], joint_pos_lower_deg_[static_cast<size_t>(i)],
+                        joint_pos_upper_deg_[static_cast<size_t>(i)]);
+  }
+  return out;
+}
+
+void FanucClient::jointSlewThread()
+{
+  // Never allow a zero period — that busy-spins writeJointTarget and starves UDP RX.
+  const uint32_t period_ms = std::max(control_period_, kDefaultControlPeriodMs);
+  const double period_s = static_cast<double>(period_ms) / 1000.0;
+
+  while (slew_running_.load(std::memory_order_relaxed))
+  {
+    const auto t0 = std::chrono::steady_clock::now();
+    const double multiplier =
+        std::clamp(slew_rate_multiplier_.load(std::memory_order_relaxed), kMinSlewRateMultiplier,
+                   kMaxSlewRateMultiplier);
+    const double dt = period_s / multiplier;
+    if (is_streaming_.load(std::memory_order_relaxed))
+    {
+      try
+      {
+        if (do_motn_ctrl_.load(std::memory_order_relaxed))
+        {
+          Eigen::VectorXd cmd;
+          {
+            std::lock_guard<std::mutex> lock(slew_mutex_);
+            applySlewLimitsLocked();
+            stream_slew_.setTarget(joint_goal_);
+            cmd = stream_slew_.step(dt);
+            cmd = clampToPositionLimits(cmd);
+          }
+          writeJointTarget(cmd);
+        }
+        else
+        {
+          // Keep command_pos glued to measured while disarmed (do_motn_ctrl=0).
+          // writeJointTarget already substitutes last_joint_angles_ when disarmed.
+          writeJointTarget(last_joint_angles_);
+        }
+      }
+      catch (const std::exception&)
+      {
+        // Stream may be tearing down; exit quietly on the next flag check.
+      }
+    }
+    std::this_thread::sleep_until(
+        t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(dt)));
+  }
 }
 
 Eigen::Ref<const Eigen::VectorXd> FanucClient::readJointAngles()
 {
   AssertIsStreaming(is_streaming_);
   readStateFromQueue();
-
-  return last_joint_angles_;
-}
-
-Eigen::Ref<const Eigen::VectorXd> FanucClient::readJointAnglesRMI()
-{
-  AssertNotStreaming(is_streaming_);
-
-  const auto response = rmi_connection_->readJointAngles(std::nullopt, std::nullopt);
-  last_joint_angles_[0] = response.JointAngle.J1;
-  last_joint_angles_[1] = response.JointAngle.J2;
-  last_joint_angles_[2] = response.JointAngle.J3;
-  last_joint_angles_[3] = response.JointAngle.J4;
-  last_joint_angles_[4] = response.JointAngle.J5;
-  last_joint_angles_[5] = response.JointAngle.J6;
-  last_joint_angles_[6] = response.JointAngle.J7;
-  last_joint_angles_[7] = response.JointAngle.J8;
-  last_joint_angles_[8] = response.JointAngle.J9;
-
-  last_joint_angles_[2] = last_joint_angles_[2] + last_joint_angles_[1];
 
   return last_joint_angles_;
 }
@@ -388,7 +497,8 @@ void FanucClient::streamMotionThread(const Eigen::VectorXd& joint_angles)
     // Handle IO commands.
     while (p_queue_impl_->command_io_queue_.try_dequeue(command_io)) {}
 
-    stream_motion_->sendCommand(command_pos, !is_streaming_, command_io, ((motion_possible && do_motn_ctrl_) ? 1 : 0));
+    stream_motion_->sendCommand(command_pos, !is_streaming_, command_io,
+                                ((motion_possible && do_motn_ctrl_.load(std::memory_order_relaxed)) ? 1 : 0));
     p_queue_impl_->robot_state_queue_.enqueue(status);
   }
 }
@@ -459,121 +569,46 @@ bool FanucClient::getLimits(const double v_peak, const double payload, std::vect
   return true;
 }
 
-void FanucClient::startRMI()
-{
-  try
-  {
-    const auto rmi_status = rmi_connection_->getStatus(std::nullopt);
-    switch (rmi_status.ProgramStatus)
-    {
-      case 0:  // In Running
-        if (rmi_running_)
-        {  // RMI_MOVE.TP is already running.
-          return;
-        }
-        // The status can be 0 before first FRC_INITIALIZE.
-        // Continue to initialization.
-        break;
-      case 1:  // In Canceled
-      case 2:  // In Hold
-        // Abort and continue to initialization.
-        rmi_connection_->abort(std::nullopt);
-        break;
-      default:
-        throw std::runtime_error("RMI's ProgramStatus value is strange: " + std::to_string(rmi_status.ProgramStatus));
-        return;
-        break;
-    }
-  }
-  catch (const std::runtime_error& e)
-  {
-    throw std::runtime_error("Failed to get RMI status");
-    return;
-  }
-
-  try
-  {
-    rmi_connection_->reset(std::nullopt);
-    rmi_connection_->initializeRemoteMotion(std::nullopt,  // timeout
-                                            1,             // groupmask
-                                            std::nullopt,  // rtsa
-                                            std::nullopt   // pltzmode
-    );
-  }
-  catch (const std::runtime_error&)
-  {
-    std::cout << "Need to reset and abort" << std::endl;
-    rmi_connection_->abort(std::nullopt);
-    rmi_connection_->reset(std::nullopt);
-    rmi_connection_->getStatus(std::nullopt);
-    rmi_connection_->initializeRemoteMotion(std::nullopt,  // timeout
-                                            1,             // groupmask
-                                            std::nullopt,  // rtsa
-                                            std::nullopt   // pltzmode
-    );
-  }
-  rmi_running_ = true;
-}
-
 bool FanucClient::startMotionControl()
 {
+  AssertIsStreaming(is_streaming_);
   try
   {
-    startRMI();
     readStateFromQueue();
-    if (!robot_status_.motion_possible)  // IBGN start is not running yet.
+    if (robot_status_.motion_possible)
     {
-      // Wait for robot to stop motion
-      auto motion_pre_loop_time = std::chrono::steady_clock::now();
-      while (true)
-      {
-        readStateFromQueue();
-        if (!in_motion_)
-        {
-          break;
-        }
+      setDoMotnCtrl(true);
+      return true;
+    }
 
-        if (std::chrono::steady_clock::now() - motion_pre_loop_time > std::chrono::milliseconds(1000))
-        {
-          break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      }
-      rmi_connection_->programCallNonBlocking("STREAM_MOTN");
-
-      motion_pre_loop_time = std::chrono::steady_clock::now();
-      while (true)
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      readStateFromQueue();
+      if (robot_status_.motion_possible)
       {
-        if (std::chrono::steady_clock::now() - motion_pre_loop_time > std::chrono::seconds(1))
-        {
-          throw std::runtime_error("Stream Motion is not ready in 1 second.");
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        readStateFromQueue();
-        if (robot_status_.motion_possible)
-        {
-          do_motn_ctrl_ = true;
-          break;
-        }
+        setDoMotnCtrl(true);
+        return true;
       }
     }
+    std::cerr << kStatusStatusNotReadyMessage << std::endl;
+    return false;
   }
   catch (const std::runtime_error& e)
   {
-    std::cerr << "Failed to start motion control: " << e.what() << std::endl;
+    std::cerr << "Failed to check motion control readiness: " << e.what() << std::endl;
     return false;
   }
-
-  return true;
 }
 
 void FanucClient::stopMotionControl()
 {
   AssertIsStreaming(is_streaming_);
 
-  do_motn_ctrl_ = false;
+  setDoMotnCtrl(false);
 
-  // Wait for robot to stop motion
+  // Wait for robot to stop motion (STREAM_MOTN stays running on the TP).
   const auto motion_pre_loop_time = std::chrono::steady_clock::now();
   while (true)
   {
@@ -589,8 +624,6 @@ void FanucClient::stopMotionControl()
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-
-  rmi_connection_->abort(std::nullopt);
 }
 
 // Throws if it fails to start real-time communication
@@ -606,40 +639,21 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
     stream_motion_->configureGPIO(gpio_buffer_->toStreamMotionConfig());
   }
 
-  if (do_motn_ctrl_)
-  {
-    startRMI();
-    rmi_connection_->programCallNonBlocking("STREAM_MOTN");
-  }
-
-  // Wait for the stream connection to be ready
+  // Wait for UDP status packets. STREAM_MOTN must already be running on the TP.
   stream_motion::RobotStatusPacket status;
   stream_motion_->sendStartPacket();
   stream_motion_->configureForceSensor(0, force_sensor_type_);
   const auto pre_loop_time = std::chrono::steady_clock::now();
-  bool got_status = false;
   while (true)
   {
     if (stream_motion_->getStatusPacket(status))
     {
-      got_status = true;
-      if ((status.status & 0x1) || !do_motn_ctrl_)
-      {
-        /* STREAM_MOTN.TP is ready */
-        /* or motion control is not requested */
-        break;
-      }
+      // Accept any status for stream bring-up; motion_possible is checked separately.
+      break;
     }
     if (std::chrono::steady_clock::now() - pre_loop_time > std::chrono::seconds(2))
     {
-      if (got_status)
-      {
-        throw std::runtime_error(kStatusStatusNotReadyMessage);
-      }
-      else
-      {
-        throw std::runtime_error(kStatusPacketFailureMessage);
-      }
+      throw std::runtime_error(kStatusPacketFailureMessage);
     }
   }
   start_time_ = std::chrono::high_resolution_clock::now();
@@ -651,17 +665,37 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
     last_joint_angles_[i] = static_cast<double>(status.joint_angle[i]);
     command_pos[i] = static_cast<double>(status.joint_angle[i]);
   }
-  stream_motion_->sendCommand(command_pos, false, {}, (do_motn_ctrl_ ? 1 : 0));
+  stream_motion_->sendCommand(command_pos, false, {}, (do_motn_ctrl_.load(std::memory_order_relaxed) ? 1 : 0));
+
+  {
+    std::lock_guard<std::mutex> lock(slew_mutex_);
+    joint_goal_ = last_joint_angles_;
+    applySlewLimitsLocked();
+    stream_slew_.reset(last_joint_angles_);
+  }
 
   if (rt_thread_.joinable())
   {
     rt_thread_.join();
   }
   rt_thread_ = std::thread([this] { streamMotionThread(last_joint_angles_); });
+
+  slew_running_.store(true, std::memory_order_relaxed);
+  if (slew_thread_.joinable())
+  {
+    slew_thread_.join();
+  }
+  slew_thread_ = std::thread([this] { jointSlewThread(); });
 }
 
 void FanucClient::stopRealtimeStream()
 {
+  setDoMotnCtrl(false);
+  slew_running_.store(false, std::memory_order_relaxed);
+  if (slew_thread_.joinable())
+  {
+    slew_thread_.join();
+  }
   is_streaming_ = false;
   if (rt_thread_.joinable())
   {
@@ -688,7 +722,6 @@ void FanucClient::stopRealtimeStream()
     }
   } while (status.status & 0x8);
 
-  rmi_connection_->abort(std::nullopt);
   stream_motion_->sendStopPacket();
 }
 
@@ -700,11 +733,6 @@ bool FanucClient::isStreaming()
 uint32_t FanucClient::getControlPeriod() const
 {
   return control_period_;
-}
-
-void FanucClient::setPayloadSchedule(const uint8_t payload_schedule) const
-{
-  rmi_connection_->setPayloadSchedule(payload_schedule, std::nullopt);
 }
 
 void FanucClient::validateGPIOBuffer(const std::shared_ptr<GPIOBuffer>& gpio_buffer) const
@@ -741,12 +769,7 @@ void FanucClient::setupSignalHandler()
 {
   std::lock_guard<std::mutex> lock(instance_mutex_);
   instance_ = this;
-  struct sigaction sa;
-  sa.sa_handler = signalHandler;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;
-  // Save previous handler and install new one
-  sigaction(SIGINT, &sa, &previous_sigaction_);
+  previous_signal_handler_ = std::signal(SIGINT, signalHandler);
 }
 
 void FanucClient::restoreSignalHandler()
@@ -755,8 +778,7 @@ void FanucClient::restoreSignalHandler()
   if (instance_ == this)
   {
     instance_ = nullptr;
-    // Restore previous signal handler using sigaction (consistent with setup)
-    sigaction(SIGINT, &previous_sigaction_, nullptr);
+    std::signal(SIGINT, previous_signal_handler_);
   }
 }
 

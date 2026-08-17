@@ -5,7 +5,10 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <csignal>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -14,6 +17,7 @@
 #include <Eigen/Core>
 
 #include "fanuc_client/gpio_buffer.hpp"
+#include "fanuc_client/joint_slew_interpolator.hpp"
 #include "rmi/rmi.hpp"
 #include "stream_motion/stream.hpp"
 
@@ -54,9 +58,9 @@ class FanucClient
 {
 public:
   FanucClient() = delete;
-  explicit FanucClient(std::string robot_ip, uint16_t stream_motion_port = 60015, uint16_t rmi_port = 16001,
-                       std::unique_ptr<stream_motion::StreamMotionInterface> stream_motion_interface = nullptr,
-                       std::unique_ptr<rmi::RMIConnectionInterface> rmi_connection_interface = nullptr);
+  /** Stream Motion only. STREAM_MOTN (IBGN) must already be running on the TP. */
+  explicit FanucClient(std::string robot_ip, uint16_t stream_motion_port = 60015,
+                       std::unique_ptr<stream_motion::StreamMotionInterface> stream_motion_interface = nullptr);
 
   FanucClient(const FanucClient&) = delete;
   FanucClient& operator=(const FanucClient&) = delete;
@@ -65,11 +69,39 @@ public:
 
   void writeJointTarget(const Eigen::VectorXd& joint_targets);
 
-  void writeJointTargetRMI(const Eigen::VectorXd& joint_targets);
+  /**
+   * Set the sticky joint goal (degrees) chased by the slew feeder thread.
+   * Does not enqueue a raw jump — the slewer publishes shaped commands via
+   * writeJointTarget into the existing Stream Motion queue.
+   */
+  void setJointGoal(const Eigen::VectorXd& joint_goal_deg);
+
+  Eigen::VectorXd getJointGoal() const;
+
+  void setStreamMaxVel(double max_vel_deg_s);
+  double getStreamMaxVel() const;
+
+  void setStreamMaxAcc(double max_acc_deg_s2);
+  double getStreamMaxAcc() const;
+
+  /**
+   * Slew feeder rate as a multiple of the controller servo period.
+   * 6.0 at an 8 ms period → 750 Hz. Clamped to [1, 16]. Takes effect on the
+   * next slew-thread tick (no restart required).
+   */
+  void setSlewRateMultiplier(double multiplier);
+  double getSlewRateMultiplier() const;
+
+  /** Soft position envelope (degrees) applied to slewed commands. Empty disables. */
+  void setJointPositionLimits(const std::vector<double>& lower_deg, const std::vector<double>& upper_deg);
+
+  /** Re-seed sticky goal + slewer from the latest measured joints. */
+  void resetStreamCommandToMeasured();
+
+  /** Re-seed sticky goal + slewer from an explicit pose (e.g. hold on disarm). */
+  void resetStreamCommand(const Eigen::VectorXd& joints_deg);
 
   Eigen::Ref<const Eigen::VectorXd> readJointAngles();
-
-  Eigen::Ref<const Eigen::VectorXd> readJointAnglesRMI();
 
   bool sendIOCommand() const;
 
@@ -82,28 +114,33 @@ public:
 
   bool isStreaming();
 
-  void startRMI();
-
+  /**
+   * Arm local motion control once Stream Motion reports motion_possible
+   * (STREAM_MOTN / IBGN ready). Sets do_motn_ctrl=true on success.
+   * Does not start or stop the TP program — operator keeps STREAM_MOTN running.
+   */
   bool startMotionControl();
 
+  /** Disarm motion control locally (do_motn_ctrl=false). Leaves STREAM_MOTN running. */
   void stopMotionControl();
 
   bool getDoMotnCtrl() const
   {
-    return do_motn_ctrl_;
+    return do_motn_ctrl_.load(std::memory_order_relaxed);
   }
 
-  void setDoMotnCtrl(const bool do_motn_ctrl)
-  {
-    do_motn_ctrl_ = do_motn_ctrl;
-  }
+  /**
+   * Arm/disarm Stream Motion joint following.
+   * On rising and falling edges, reseeds the slewer from the latest measured
+   * joints so command_pos cannot diverge across the transition.
+   * While disarmed, jointSlewThread keeps enqueueing measured holds.
+   */
+  void setDoMotnCtrl(bool do_motn_ctrl);
 
   bool getLimits(double v_peak, double payload, std::vector<double>& vel_limit, std::vector<double>& acc_limit,
                  std::vector<double>& jerk_limit) const;
 
   uint32_t getControlPeriod() const;
-
-  void setPayloadSchedule(uint8_t payload_schedule) const;
 
   void validateGPIOBuffer(const std::shared_ptr<GPIOBuffer>& gpio_buffer) const;
 
@@ -168,20 +205,26 @@ private:
   /** Mutex to protect instance_ access from signal handler */
   static std::mutex instance_mutex_;
 
-  /** Previous signal handler to restore */
-  static struct sigaction previous_sigaction_;
+  /** Previous SIGINT handler to restore (portable; avoids POSIX sigaction) */
+  static void (*previous_signal_handler_)(int);
 
 private:
   void readStateFromQueue();
 
   void streamMotionThread(const Eigen::VectorXd& joint_angles);
 
+  /** Accel-limited feeder that calls writeJointTarget into the existing queue. */
+  void jointSlewThread();
+
+  void applySlewLimitsLocked();
+
+  Eigen::VectorXd clampToPositionLimits(const Eigen::VectorXd& joints) const;
+
   /** Grab the limits from the robot.*/
   void fetchRobotLimits();
 
   const std::string robot_ip_;
   const uint16_t stream_motion_port_;
-  const uint16_t rmi_port_;
 
   // Limits
   Eigen::MatrixXd vel_limits_no_load_ = Eigen::MatrixXd::Zero(9, 20);
@@ -210,12 +253,28 @@ private:
 
   // Real time thread data
   std::thread rt_thread_;
+  std::thread slew_thread_;
+  std::atomic<bool> slew_running_{ false };
 
-  bool do_motn_ctrl_ = true;
+  std::atomic<bool> do_motn_ctrl_{ false };
 
-  // Manages RMI connection
-  std::shared_ptr<rmi::RMIConnectionInterface> rmi_connection_;
-  std::atomic<bool> rmi_running_ = false;
+  // Python-tuned slew limits (defaults match example_fanuc configs).
+  static constexpr double kDefaultStreamMaxVelDegS = 60.0;
+  static constexpr double kDefaultStreamMaxAccDegS2 = 300.0;
+  static constexpr double kDefaultSlewRateMultiplier = 4.0;
+  static constexpr double kMinSlewRateMultiplier = 1.0;
+  static constexpr double kMaxSlewRateMultiplier = 16.0;
+  /** Fallback when getControllerCapability fails (typical CRX Stream Motion period). */
+  static constexpr uint32_t kDefaultControlPeriodMs = 8;
+  std::atomic<double> stream_max_vel_deg_s_{ kDefaultStreamMaxVelDegS };
+  std::atomic<double> stream_max_acc_deg_s2_{ kDefaultStreamMaxAccDegS2 };
+  std::atomic<double> slew_rate_multiplier_{ kDefaultSlewRateMultiplier };
+
+  mutable std::mutex slew_mutex_;
+  JointSlewInterpolator stream_slew_{ stream_motion::kMaxAxisNumber };
+  Eigen::VectorXd joint_goal_ = Eigen::VectorXd::Zero(stream_motion::kMaxAxisNumber);
+  std::vector<double> joint_pos_lower_deg_;
+  std::vector<double> joint_pos_upper_deg_;
 
   // Output command interpolation buffer target size for stream motion control
   uint32_t out_cmd_interp_buff_target_;
@@ -227,6 +286,7 @@ private:
   std::unique_ptr<PQueueImpl> p_queue_impl_;
 };
 
+/** Retained for ROS GPIO / hardware_interface callers; FanucClient no longer uses RMI. */
 class RMISingleton
 {
 public:
