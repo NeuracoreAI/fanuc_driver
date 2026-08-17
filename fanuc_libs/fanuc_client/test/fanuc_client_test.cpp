@@ -267,6 +267,20 @@ TEST(FanucClientTest, CapabilityFailureDefaultsControlPeriod)
   EXPECT_EQ(fanuc_client.getControlPeriod(), 8u);
 }
 
+TEST(FanucClientTest, SlewRateMultiplierStoresAndClamps)
+{
+  std::atomic<bool> stream_connected = false;
+  auto stream_motion_interface = std::make_unique<NiceMockStreamMotionConnection>(stream_connected);
+  fanuc_client::FanucClient fanuc_client("127.0.0.1", 60015, std::move(stream_motion_interface));
+  EXPECT_DOUBLE_EQ(fanuc_client.getSlewRateMultiplier(), 4.0);
+  fanuc_client.setSlewRateMultiplier(6.0);
+  EXPECT_DOUBLE_EQ(fanuc_client.getSlewRateMultiplier(), 6.0);
+  fanuc_client.setSlewRateMultiplier(0.1);
+  EXPECT_DOUBLE_EQ(fanuc_client.getSlewRateMultiplier(), 1.0);
+  fanuc_client.setSlewRateMultiplier(100.0);
+  EXPECT_DOUBLE_EQ(fanuc_client.getSlewRateMultiplier(), 16.0);
+}
+
 TEST(FanucClientTest, DisarmedTrackingKeepsSendingMeasured)
 {
   std::atomic<bool> stream_connected = false;

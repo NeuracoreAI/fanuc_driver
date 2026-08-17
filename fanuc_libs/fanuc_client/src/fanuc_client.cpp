@@ -7,6 +7,7 @@
 
 #include <Eigen/Core>
 #include <algorithm>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <iostream>
@@ -252,6 +253,17 @@ double FanucClient::getStreamMaxAcc() const
   return stream_max_acc_deg_s2_.load(std::memory_order_relaxed);
 }
 
+void FanucClient::setSlewRateMultiplier(const double multiplier)
+{
+  slew_rate_multiplier_.store(std::clamp(multiplier, kMinSlewRateMultiplier, kMaxSlewRateMultiplier),
+                              std::memory_order_relaxed);
+}
+
+double FanucClient::getSlewRateMultiplier() const
+{
+  return slew_rate_multiplier_.load(std::memory_order_relaxed);
+}
+
 void FanucClient::setJointPositionLimits(const std::vector<double>& lower_deg, const std::vector<double>& upper_deg)
 {
   std::lock_guard<std::mutex> lock(slew_mutex_);
@@ -332,12 +344,14 @@ void FanucClient::jointSlewThread()
   // Never allow a zero period — that busy-spins writeJointTarget and starves UDP RX.
   const uint32_t period_ms = std::max(control_period_, kDefaultControlPeriodMs);
   const double period_s = static_cast<double>(period_ms) / 1000.0;
-  const double dt = period_s / kSlewRateMultiplier;
-  const auto tick = std::chrono::duration<double>(dt);
 
   while (slew_running_.load(std::memory_order_relaxed))
   {
     const auto t0 = std::chrono::steady_clock::now();
+    const double multiplier =
+        std::clamp(slew_rate_multiplier_.load(std::memory_order_relaxed), kMinSlewRateMultiplier,
+                   kMaxSlewRateMultiplier);
+    const double dt = period_s / multiplier;
     if (is_streaming_.load(std::memory_order_relaxed))
     {
       try
@@ -366,7 +380,8 @@ void FanucClient::jointSlewThread()
         // Stream may be tearing down; exit quietly on the next flag check.
       }
     }
-    std::this_thread::sleep_until(t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(tick));
+    std::this_thread::sleep_until(
+        t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(dt)));
   }
 }
 

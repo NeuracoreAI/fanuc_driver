@@ -84,6 +84,14 @@ public:
   void setStreamMaxAcc(double max_acc_deg_s2);
   double getStreamMaxAcc() const;
 
+  /**
+   * Slew feeder rate as a multiple of the controller servo period.
+   * 6.0 at an 8 ms period → 750 Hz. Clamped to [1, 16]. Takes effect on the
+   * next slew-thread tick (no restart required).
+   */
+  void setSlewRateMultiplier(double multiplier);
+  double getSlewRateMultiplier() const;
+
   /** Soft position envelope (degrees) applied to slewed commands. Empty disables. */
   void setJointPositionLimits(const std::vector<double>& lower_deg, const std::vector<double>& upper_deg);
 
@@ -253,11 +261,14 @@ private:
   // Python-tuned slew limits (defaults match example_fanuc configs).
   static constexpr double kDefaultStreamMaxVelDegS = 60.0;
   static constexpr double kDefaultStreamMaxAccDegS2 = 300.0;
-  static constexpr double kSlewRateMultiplier = 4.0;
+  static constexpr double kDefaultSlewRateMultiplier = 4.0;
+  static constexpr double kMinSlewRateMultiplier = 1.0;
+  static constexpr double kMaxSlewRateMultiplier = 16.0;
   /** Fallback when getControllerCapability fails (typical CRX Stream Motion period). */
   static constexpr uint32_t kDefaultControlPeriodMs = 8;
   std::atomic<double> stream_max_vel_deg_s_{ kDefaultStreamMaxVelDegS };
   std::atomic<double> stream_max_acc_deg_s2_{ kDefaultStreamMaxAccDegS2 };
+  std::atomic<double> slew_rate_multiplier_{ kDefaultSlewRateMultiplier };
 
   mutable std::mutex slew_mutex_;
   JointSlewInterpolator stream_slew_{ stream_motion::kMaxAxisNumber };
