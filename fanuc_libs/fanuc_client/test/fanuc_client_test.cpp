@@ -323,7 +323,7 @@ TEST(FanucClientTest, SetDoMotnCtrlEdgeReseedsGoalFromMeasured)
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 
-  // Drain status so last_joint_angles_ matches the configured measured pose.
+  // The stream-start packet is published before the slew thread runs.
   Eigen::VectorXd measured = fanuc_client.readJointAngles();
   EXPECT_NEAR(measured[0], 1.5, 1e-3);
   EXPECT_NEAR(measured[1], -2.5, 1e-3);

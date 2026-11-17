@@ -101,7 +101,8 @@ public:
   /** Re-seed sticky goal + slewer from an explicit pose (e.g. hold on disarm). */
   void resetStreamCommand(const Eigen::VectorXd& joints_deg);
 
-  Eigen::Ref<const Eigen::VectorXd> readJointAngles();
+  /** Latest measured joints (degrees). Also publishes IO status into the GPIO buffer. */
+  Eigen::VectorXd readJointAngles();
 
   bool sendIOCommand() const;
 
@@ -164,15 +165,11 @@ public:
     return force_sensor_type_;
   }
 
-  const RobotStatus& robot_status() const
-  {
-    return robot_status_;
-  }
+  /** Copy of the latest robot status. Does not remove a status sample. */
+  RobotStatus robot_status() const;
 
-  const ForceSensor& force_sensor() const
-  {
-    return force_sensor_;
-  }
+  /** Copy of the latest force sensor sample. Does not remove a status sample. */
+  ForceSensor force_sensor() const;
 
   void configureForceSensor(uint32_t do_reset, uint32_t force_sensor_type) const;
 
@@ -209,7 +206,14 @@ private:
   static void (*previous_signal_handler_)(int);
 
 private:
+  /** Sole consumer of robot_state_queue_. Called only from jointSlewThread. */
   void readStateFromQueue();
+
+  /** Publish one status packet for any number of readers. The writer does not wait. */
+  void publishStatus(const stream_motion::RobotStatusPacket& packet);
+
+  /** Copy the latest published status. Retries if a publish overlaps the copy. */
+  stream_motion::RobotStatusPacket loadStatus() const;
 
   void streamMotionThread(const Eigen::VectorXd& joint_angles);
 
@@ -241,10 +245,11 @@ private:
 
   std::array<double, stream_motion::kMaxAxisNumber> command_pos;
   Eigen::VectorXd last_joint_angles_ = Eigen::VectorXd::Zero(9);
-  Eigen::VectorXd last_joint_angles_cmd_ = Eigen::VectorXd::Zero(9);
-  RobotStatus robot_status_;
-  ForceSensor force_sensor_;
-  bool in_motion_ = false;
+
+  // Latest status packet. status_seq_ is even while published_status_ is stable
+  // and odd while a publish is in progress. Readers copy and retry on a mismatch.
+  std::atomic<uint32_t> status_seq_{ 0 };
+  stream_motion::RobotStatusPacket published_status_{};
   uint32_t control_period_ = 0;
   uint32_t client_version_ = 0;  // stream motion client version
 

@@ -70,6 +70,41 @@ constexpr ContactStopMode ToContactStopMode(stream_motion::ContactStopStatus sta
   return ContactStopMode::None;
 }
 
+Eigen::VectorXd JointsFromStatus(const stream_motion::RobotStatusPacket& status)
+{
+  Eigen::VectorXd joints(static_cast<Eigen::Index>(status.joint_angle.size()));
+  for (Eigen::Index i = 0; i < joints.size(); ++i)
+  {
+    joints[i] = static_cast<double>(status.joint_angle[static_cast<size_t>(i)]);
+  }
+  return joints;
+}
+
+RobotStatus RobotStatusFromPacket(const stream_motion::RobotStatusPacket& status)
+{
+  RobotStatus out;
+  out.in_error = status.robot_status & 0x1;
+  out.tp_enabled = status.robot_status & 0x2;
+  out.e_stopped = status.robot_status & 0x4;
+  out.motion_possible = status.status & 0x1;
+  out.contact_stop_mode = ToContactStopMode(status.contact_stop_status);
+  out.safety_scale = status.safety_scale;
+  return out;
+}
+
+ForceSensor ForceFromPacket(const stream_motion::RobotStatusPacket& status)
+{
+  ForceSensor out;
+  out.force_x = status.force_x;
+  out.force_y = status.force_y;
+  out.force_z = status.force_z;
+  out.moment_x = status.moment_x;
+  out.moment_y = status.moment_y;
+  out.moment_z = status.moment_z;
+  out.fs_type = status.fs_type;
+  return out;
+}
+
 }  // namespace
 
 struct FanucClient::PQueueImpl
@@ -150,6 +185,36 @@ FanucClient::~FanucClient()
   restoreSignalHandler();
 }
 
+void FanucClient::publishStatus(const stream_motion::RobotStatusPacket& packet)
+{
+  const uint32_t seq = status_seq_.load(std::memory_order_relaxed);
+  status_seq_.store(seq + 1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+  published_status_ = packet;
+  std::atomic_thread_fence(std::memory_order_release);
+  status_seq_.store(seq + 2, std::memory_order_release);
+}
+
+stream_motion::RobotStatusPacket FanucClient::loadStatus() const
+{
+  stream_motion::RobotStatusPacket packet;
+  for (;;)
+  {
+    const uint32_t seq = status_seq_.load(std::memory_order_acquire);
+    if ((seq & 1u) != 0u)
+    {
+      continue;
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    packet = published_status_;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (seq == status_seq_.load(std::memory_order_acquire))
+    {
+      return packet;
+    }
+  }
+}
+
 void FanucClient::readStateFromQueue()
 {
   stream_motion::RobotStatusPacket robot_status;
@@ -162,54 +227,22 @@ void FanucClient::readStateFromQueue()
   {
     return;
   }
-
-  for (Eigen::Index i = 0; i < robot_status.joint_angle.size(); ++i)
-  {
-    last_joint_angles_[i] = static_cast<double>(robot_status.joint_angle[i]);
-  }
-
-  if (gpio_buffer_ != nullptr)
-  {
-    gpio_buffer_->status_buffer() = robot_status.io_status;
-  }
-
-  robot_status_.in_error = robot_status.robot_status & 0x1;
-  robot_status_.tp_enabled = robot_status.robot_status & 0x2;
-  robot_status_.e_stopped = robot_status.robot_status & 0x4;
-  robot_status_.motion_possible = robot_status.status & 0x1;
-  robot_status_.contact_stop_mode = ToContactStopMode(robot_status.contact_stop_status);
-  robot_status_.safety_scale = robot_status.safety_scale;
-
-  in_motion_ = robot_status.status & 0x8;
-
-  force_sensor_.force_x = robot_status.force_x;
-  force_sensor_.force_y = robot_status.force_y;
-  force_sensor_.force_z = robot_status.force_z;
-  force_sensor_.moment_x = robot_status.moment_x;
-  force_sensor_.moment_y = robot_status.moment_y;
-  force_sensor_.moment_z = robot_status.moment_z;
-  force_sensor_.fs_type = robot_status.fs_type;
+  publishStatus(robot_status);
 }
 
 void FanucClient::writeJointTarget(const Eigen::VectorXd& joint_targets)
 {
   AssertIsStreaming(is_streaming_);
-  readStateFromQueue();
-  if (robot_status_.motion_possible && do_motn_ctrl_.load(std::memory_order_relaxed))
-  {
-    last_joint_angles_cmd_ = joint_targets;
-  }
-  else
-  {
-    last_joint_angles_cmd_ = last_joint_angles_;
-  }
-
-  if (joint_targets.size() != last_joint_angles_.size())
+  const stream_motion::RobotStatusPacket status = loadStatus();
+  const Eigen::VectorXd measured = JointsFromStatus(status);
+  if (joint_targets.size() != measured.size())
   {
     throw std::invalid_argument("Joint targets size does not match the size of last joint angles.");
   }
+  const bool follow = (status.status & 0x1) && do_motn_ctrl_.load(std::memory_order_relaxed);
+  const Eigen::VectorXd& command = follow ? joint_targets : measured;
   auto cur_time_from_start = std::chrono::high_resolution_clock::now() - start_time_;
-  p_queue_impl_->command_queue_.enqueue({ cur_time_from_start, last_joint_angles_cmd_ });
+  p_queue_impl_->command_queue_.enqueue({ cur_time_from_start, command });
 }
 
 void FanucClient::setJointGoal(const Eigen::VectorXd& joint_goal_deg)
@@ -274,8 +307,7 @@ void FanucClient::setJointPositionLimits(const std::vector<double>& lower_deg, c
 void FanucClient::resetStreamCommandToMeasured()
 {
   AssertIsStreaming(is_streaming_);
-  readStateFromQueue();
-  resetStreamCommand(last_joint_angles_);
+  resetStreamCommand(JointsFromStatus(loadStatus()));
 }
 
 void FanucClient::resetStreamCommand(const Eigen::VectorXd& joints_deg)
@@ -303,8 +335,7 @@ void FanucClient::setDoMotnCtrl(const bool do_motn_ctrl)
   {
     try
     {
-      readStateFromQueue();
-      resetStreamCommand(last_joint_angles_);
+      resetStreamCommand(JointsFromStatus(loadStatus()));
     }
     catch (const std::exception&)
     {
@@ -356,6 +387,7 @@ void FanucClient::jointSlewThread()
     {
       try
       {
+        readStateFromQueue();
         if (do_motn_ctrl_.load(std::memory_order_relaxed))
         {
           Eigen::VectorXd cmd;
@@ -371,8 +403,7 @@ void FanucClient::jointSlewThread()
         else
         {
           // Keep command_pos glued to measured while disarmed (do_motn_ctrl=0).
-          // writeJointTarget already substitutes last_joint_angles_ when disarmed.
-          writeJointTarget(last_joint_angles_);
+          writeJointTarget(JointsFromStatus(loadStatus()));
         }
       }
       catch (const std::exception&)
@@ -385,12 +416,25 @@ void FanucClient::jointSlewThread()
   }
 }
 
-Eigen::Ref<const Eigen::VectorXd> FanucClient::readJointAngles()
+Eigen::VectorXd FanucClient::readJointAngles()
 {
   AssertIsStreaming(is_streaming_);
-  readStateFromQueue();
+  const stream_motion::RobotStatusPacket status = loadStatus();
+  if (gpio_buffer_ != nullptr)
+  {
+    gpio_buffer_->status_buffer() = status.io_status;
+  }
+  return JointsFromStatus(status);
+}
 
-  return last_joint_angles_;
+RobotStatus FanucClient::robot_status() const
+{
+  return RobotStatusFromPacket(loadStatus());
+}
+
+ForceSensor FanucClient::force_sensor() const
+{
+  return ForceFromPacket(loadStatus());
 }
 
 bool FanucClient::sendIOCommand() const
@@ -574,8 +618,7 @@ bool FanucClient::startMotionControl()
   AssertIsStreaming(is_streaming_);
   try
   {
-    readStateFromQueue();
-    if (robot_status_.motion_possible)
+    if (robot_status().motion_possible)
     {
       setDoMotnCtrl(true);
       return true;
@@ -585,8 +628,7 @@ bool FanucClient::startMotionControl()
     while (std::chrono::steady_clock::now() < deadline)
     {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      readStateFromQueue();
-      if (robot_status_.motion_possible)
+      if (robot_status().motion_possible)
       {
         setDoMotnCtrl(true);
         return true;
@@ -612,8 +654,7 @@ void FanucClient::stopMotionControl()
   const auto motion_pre_loop_time = std::chrono::steady_clock::now();
   while (true)
   {
-    readStateFromQueue();
-    if (!in_motion_)
+    if ((loadStatus().status & 0x8) == 0)
     {
       break;
     }
@@ -657,6 +698,7 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
     }
   }
   start_time_ = std::chrono::high_resolution_clock::now();
+  publishStatus(status);
   p_queue_impl_->robot_state_queue_.enqueue(status);
   is_streaming_ = true;
   last_joint_angles_ = Eigen::VectorXd::Zero(status.joint_angle.size());

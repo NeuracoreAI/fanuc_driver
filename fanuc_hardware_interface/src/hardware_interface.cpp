@@ -508,7 +508,7 @@ hardware_interface::return_type FanucHardwareInterface::read(const rclcpp::Time&
   try
   {
     fr_prev_joint_pos_ = fr_joint_pos_;
-    const Eigen::Ref<const Eigen::VectorXd> joint_angles = fanuc_client_->readJointAngles();
+    const Eigen::VectorXd joint_angles = fanuc_client_->readJointAngles();
     for (Eigen::Index i = 0; i < joint_angles.size(); ++i)
     {
       fr_joint_pos_[i] = M_PI / 180.0 * joint_angles[i];
